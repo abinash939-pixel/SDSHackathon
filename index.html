@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sketch2Sim - Phase 2 with pose powers</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header>Sketch2Sim</header>
+
+  <div id="wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <div id="controls">
+    <div id="toolbar">
+      <div class="group">
+        <button id="gravityBtn" class="tb" data-icon="gravity"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="linesBtn" class="tb" data-icon="lines"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="reverseBtn" class="tb" data-icon="reverse"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="deselectBtn" class="tb" data-icon="deselect"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="floatBtn" class="tb" data-icon="float"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="cloneBtn" class="tb" data-icon="clone"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="destroyBtn" class="tb danger" data-icon="destroy"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="clearBtn" class="tb danger" data-icon="clear"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+      </div>
+      <div class="group">
+        <button id="hitboxBtn" class="tb" data-icon="hitbox"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="skeletonBtn" class="tb" data-icon="skeleton"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+      </div>
+      <div class="group">
+        <button id="barBtn" class="tb" data-icon="panel"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="dockBtn" class="tb" data-icon="side"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="reachBtn" class="tb" data-icon="reach"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+        <button id="helpBtn" class="tb" data-icon="help"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
+      </div>
+    </div>
+    <div id="helpPanel">
+      Pinch thumb and index finger to draw. Shapes are identified automatically: Circle (rolls and bounces), Zigzag (acts as a bouncy spring), Closed loop (solid blob), or Open line (ramp or rod).<br>
+      Pinch and hold still on an object to pick it up and move it.<br>
+      Hold the white ring over an object (no pinch) to select it, then use Reverse.<br>
+      Pinch and hold on the small arrow tab at the screen edge to open or hide the button panel.<br>
+      Select objects first: hold the white ring over an object. Then use hand poses (hold each one still; the label at the top shows what it will do):<br>
+      Thumbs up = float the selected objects (or gravity off if nothing is selected). Thumbs down = let them fall (or gravity on).<br>
+      Peace sign (two fingers up) = clone the selected objects. Fist held for one second = destroy the selected objects.<br>
+      Open palm = deselect all (or pause and resume if nothing is selected). Swipe an open hand sideways = erase hovered/selected object or undo last drawing.<br>
+      The button panel has the same powers if you prefer it.<br>
+      Mouse backup: drag to draw, double-click drops a ball, shift-click selects.
+    </div>
+    <div id="status">Starting...</div>
+  </div>
+
+  <div id="hint"></div>
+  <button id="cfgBtn" title="Settings">&#9881;</button>
+  <div id="cfg"></div>
+
+  <!-- Physics libraries -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/poly-decomp@0.3.0/build/decomp.min.js"></script>
+
+  <!-- Modular application scripts -->
+  <script src="config.js"></script>
+  <script src="geometry.js"></script>
+  <script src="physics.js"></script>
+  <script src="tracking.js"></script>
+  <script src="ui.js"></script>
+</body>
+</html>
