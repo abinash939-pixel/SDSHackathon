@@ -42,6 +42,97 @@ const selected = new Set();      // objects chosen for Reverse / Powers
 
 const particles = [];
 let MAX_PARTICLES = 360;
+let mergeCooldownUntil = 0;
+let mergeCandidate = null;
+let mergeProgress = 0;
+let demergeCandidate = null;
+let demergeProgress = 0;
+var scaleSession = null;
+var shockwaves = [];
+
+function spawnShockwave(x, y, hue = 280) {
+  shockwaves.push({ x: x, y: y, r: 8, maxR: 200, hue: hue, alpha: 1, speed: 7.5 });
+  setTimeout(() => {
+    shockwaves.push({ x: x, y: y, r: 4, maxR: 150, hue: (hue + 45) % 360, alpha: 0.9, speed: 6 });
+  }, 70);
+}
+
+function scaleObject(o, factor) {
+  if (!o || !Number.isFinite(factor) || factor <= 0) return;
+  const currentScale = o.scaleMultiplier || 1;
+  const nextScale = Math.max(0.25, Math.min(4.5, currentScale * factor));
+  factor = nextScale / currentScale;
+  if (Math.abs(factor - 1) < 0.001) return;
+  o.scaleMultiplier = nextScale;
+
+  if (o.body) {
+    Body.scale(o.body, factor, factor);
+  } else if (o.bodies && o.raw) {
+    const center = centroid(o.raw);
+    for (const body of o.bodies) Body.scale(body, factor, factor, center);
+  }
+
+  const geometryArrays = o.subParts ? [o.lineLocal] : [o.local, o.polyLocal, o.lineLocal];
+  for (const points of geometryArrays) {
+    if (!points) continue;
+    for (const point of points) {
+      point.x *= factor;
+      point.y *= factor;
+    }
+  }
+  if (o.raw) {
+    const center = centroid(o.raw);
+    for (const point of o.raw) {
+      point.x = center.x + (point.x - center.x) * factor;
+      point.y = center.y + (point.y - center.y) * factor;
+    }
+  }
+  if (o.subParts) {
+    for (const part of o.subParts) {
+      for (const points of [part.local, part.polyLocal]) {
+        if (!points) continue;
+        for (const point of points) {
+          point.x *= factor;
+          point.y *= factor;
+        }
+      }
+    }
+  }
+  if (o.wellRadius) o.wellRadius *= factor;
+  o.impactAt = performance.now();
+  o.impactStrength = 0.09;
+}
+
+function checkDualHandScale() {
+  const first = penVis || pen;
+  const second = h2 && (h2.vis || h2.pen);
+  const target = Array.from(selected).find((o) => objects.includes(o) && canEditObject(o));
+  const bothPinching = pinching && h2 && h2.pinching;
+  const overToolbar = typeof toolbarPanelAt === "function" &&
+    (toolbarPanelAt(first) || toolbarPanelAt(second));
+  const overTab = (first && tabAt(first)) || (second && tabAt(second));
+
+  if (target && bothPinching && first && second && !overToolbar && !overTab) {
+    const currentDistance = dist(first, second);
+    if (!scaleSession || scaleSession.target !== target) {
+      scaleSession = { target: target, prevDist: currentDistance };
+      current = null;
+      h2.current = null;
+      grabCandidate = null;
+      h2.grabCandidate = null;
+    } else {
+      const factor = currentDistance / (scaleSession.prevDist || currentDistance);
+      scaleSession.prevDist = currentDistance;
+      if (Math.abs(factor - 1) > 0.003) {
+        scaleObject(target, factor);
+        sendObjectMove(target);
+      }
+    }
+  } else if (scaleSession) {
+    showToast("Scale: " + Math.round((scaleSession.target.scaleMultiplier || 1) * 100) + "%");
+    scaleSession = null;
+  }
+}
 
 // ------------------------------------------------------------
 // Collision Behaviours: Zigzag Springs, Star Bumpers, Diamonds & Sparks
@@ -128,6 +219,10 @@ function buildWalls() {
 
 function removeObject(o) {
   if (!o) return;
+  if (!canEditObject(o)) return;
+  if (typeof window.broadcastObjectRemoval === "function") {
+    window.broadcastObjectRemoval(o);
+  }
   if (grabbed && grabbed.obj === o) grabbed = null;
   if (h2.grab && h2.grab.obj === o) h2.grab = null;
   for (const b of o.bodies) Composite.remove(world, b);
@@ -148,7 +243,43 @@ function clearObjects() {
 }
 
 function trimObjects() {
-  while (objects.length > MAX_OBJECTS) removeObject(objects[0]);
+  while (objects.length > MAX_OBJECTS) {
+    const oldestOwned = objects.find((o) => canEditObject(o));
+    if (!oldestOwned) break;
+    removeObject(oldestOwned);
+  }
+}
+
+let nextObjectId = 1;
+
+function makeObjectId() {
+  const ownerId = window.sharedSpace ? window.sharedSpace.localOwnerId : "local";
+  return ownerId + ":" + nextObjectId++;
+}
+
+function canEditObject(o) {
+  if (window.sharedSpace && window.sharedSpace.applyingRemoteUpdate) return true;
+  if (!o || !o.ownerId || !window.sharedSpace) return true;
+  return o.ownerId === window.sharedSpace.localOwnerId;
+}
+
+function assignLocalObjectIdentity(o) {
+  if (!o) return;
+  o.ownerId = window.sharedSpace ? window.sharedSpace.localOwnerId : "local";
+  o.objectId = makeObjectId();
+}
+
+function sendObjectCreation(o) {
+  if (!o || typeof window.broadcastObjectCreation !== "function") return;
+  window.broadcastObjectCreation(o);
+}
+
+function sendObjectMove(o, force = false) {
+  if (!o || !canEditObject(o) || typeof window.broadcastObjectMove !== "function") return;
+  const now = performance.now();
+  if (!force && now - (o.lastMoveSyncAt || 0) < 40) return;
+  o.lastMoveSyncAt = now;
+  window.broadcastObjectMove(o);
 }
 
 function spawnSparks(x, y, strength) {
@@ -215,6 +346,8 @@ function applySpiralWells() {
 function stepPhysics(nowMs) {
   const dt = Math.min(nowMs - lastFrameMs, 100);
   lastFrameMs = nowMs;
+  checkDualHandScale();
+  checkMergeAndDemerge(nowMs);
   if (pausedWorld) {
     accumulator = 0;
     updateParticles(dt / STEP_MS);
@@ -241,6 +374,243 @@ function stepPhysics(nowMs) {
   updateParticles(dt / STEP_MS);
   for (const o of objects.slice()) {
     if (o.body && o.body.position.y > canvas.height + 600) removeObject(o);
+  }
+}
+
+function getObjectsEdgeGap(objA, objB) {
+  if (!objA || !objB) return Infinity;
+  if (objA.body && objB.body) {
+    const collision = Matter.Collision.collides(objA.body, objB.body);
+    if (collision && collision.collided) return 0;
+  }
+  const getBounds = (o) => o.body ? o.body.bounds : o.bodies[0].bounds;
+  const a = getBounds(objA), b = getBounds(objB);
+  const dx = Math.max(0, a.min.x - b.max.x, b.min.x - a.max.x);
+  const dy = Math.max(0, a.min.y - b.max.y, b.min.y - a.max.y);
+  return Math.hypot(dx, dy);
+}
+
+function objectWorldGeometry(o) {
+  if (!o.body || !o.local) {
+    const points = o.raw || [];
+    return { visual: points.map((p) => ({ x: p.x, y: p.y })), shape: points.map((p) => ({ x: p.x, y: p.y })) };
+  }
+  const body = o.body;
+  const c = Math.cos(body.angle), s = Math.sin(body.angle);
+  const toWorld = (arr) => (arr || []).map((p) => ({
+    x: body.position.x + p.x * c - p.y * s,
+    y: body.position.y + p.x * s + p.y * c
+  }));
+  return {
+    visual: toWorld(o.local),
+    shape: toWorld(o.kind === "solid" ? o.polyLocal : (o.lineLocal || o.local))
+  };
+}
+
+function mergeObjects(objA, objB) {
+  if (!objA || !objB || objA === objB || objA.isMerged || objB.isMerged ||
+      !canEditObject(objA) || !canEditObject(objB) ||
+      !objects.includes(objA) || !objects.includes(objB)) return null;
+
+  const makeParts = (o, dx, dy) => {
+    const source = o.body
+      ? (o.body.parts.length > 1 ? o.body.parts.slice(1) : [o.body])
+      : o.bodies;
+    return source.map((part) => {
+      const vertices = part.vertices.map((v) => ({ x: v.x + dx, y: v.y + dy }));
+      return Bodies.fromVertices(part.position.x + dx, part.position.y + dy, [vertices], {
+        friction: part.friction || 0.4,
+        restitution: part.restitution || 0.35,
+        density: part.density || 0.0014
+      }, true);
+    }).filter(bodyIsOk);
+  };
+
+  const gap = getObjectsEdgeGap(objA, objB);
+  const posA = objA.body ? objA.body.position : objA.bodies[0].position;
+  const posB = objB.body ? objB.body.position : objB.bodies[0].position;
+  const direction = Math.atan2(posA.y - posB.y, posA.x - posB.x);
+  const snapDistance = Math.max(0, gap + 4);
+  const dx = Math.cos(direction) * snapDistance;
+  const dy = Math.sin(direction) * snapDistance;
+  const parts = makeParts(objA, 0, 0).concat(makeParts(objB, dx, dy));
+  let body = parts.length >= 2 ? Body.create({ parts: parts, friction: 0.4, restitution: 0.35 }) : null;
+
+  const geometryA = objectWorldGeometry(objA);
+  const geometryB = objectWorldGeometry(objB);
+  const shift = (points, x, y) => points.map((p) => ({ x: p.x + x, y: p.y + y }));
+  const visualA = geometryA.visual;
+  const visualB = shift(geometryB.visual, dx, dy);
+  const shapeA = geometryA.shape;
+  const shapeB = shift(geometryB.shape, dx, dy);
+  if (!body || !bodyIsOk(body)) {
+    const all = visualA.concat(visualB);
+    body = buildBody(hullOf(all));
+  }
+  if (!body || !bodyIsOk(body)) return null;
+
+  const c = Math.cos(-body.angle), s = Math.sin(-body.angle);
+  const toLocal = (points) => points.map((p) => {
+    const x = p.x - body.position.x, y = p.y - body.position.y;
+    return { x: x * c - y * s, y: x * s + y * c };
+  });
+  const subParts = [
+    { source: objA, visual: visualA, shape: shapeA },
+    { source: objB, visual: visualB, shape: shapeB }
+  ].map(({ source, visual, shape }) => ({
+    kind: source.kind,
+    shapeType: source.shapeType,
+    behaviorText: source.behaviorText,
+    hue: source.hue,
+    wellRadius: source.wellRadius,
+    spiralDir: source.spiralDir,
+    local: toLocal(visual),
+    polyLocal: toLocal(shape)
+  }));
+  const wasSelected = selected.has(objA) || selected.has(objB);
+  const merged = {
+    kind: "compound",
+    shapeType: "Merged",
+    behaviorText: "Fused Compound",
+    isMerged: true,
+    scaleMultiplier: 1,
+    hue: Math.round(((objA.hue || 190) + (objB.hue || 190)) / 2),
+    bodies: [body],
+    body: body,
+    local: subParts.flatMap((part) => part.local),
+    polyLocal: subParts.flatMap((part) => part.polyLocal),
+    subParts: subParts,
+    origin: { x: body.position.x, y: body.position.y, angle: body.angle },
+    born: performance.now()
+  };
+
+  removeObject(objA);
+  removeObject(objB);
+  Composite.add(world, body);
+  objects.push(merged);
+  if (wasSelected) {
+    selected.add(merged);
+    pinObject(merged);
+  }
+  assignLocalObjectIdentity(merged);
+  sendObjectCreation(merged);
+  if (pen) startGrab(merged);
+  if (h2.pen) startGrab2(merged);
+  spawnSparks(body.position.x, body.position.y, 28);
+  spawnShockwave(body.position.x, body.position.y, merged.hue);
+  showToast("Merged into one object");
+  syncButtons();
+  return merged;
+}
+
+function demergeObject(merged) {
+  if (!merged || !merged.isMerged || !merged.subParts || merged.subParts.length !== 2 || !canEditObject(merged)) return;
+  const body = merged.body;
+  const c = Math.cos(body.angle), s = Math.sin(body.angle);
+  const toWorld = (points) => points.map((p) => ({
+    x: body.position.x + p.x * c - p.y * s,
+    y: body.position.y + p.x * s + p.y * c
+  }));
+  const targets = [penVis || pen, h2.vis || h2.pen];
+  const data = merged.subParts.map((part, i) => {
+    const visual = toWorld(part.local);
+    const shape = toWorld(part.polyLocal);
+    const currentCenter = centroid(visual);
+    const target = targets[i] || currentCenter;
+    const dx = target.x - currentCenter.x, dy = target.y - currentCenter.y;
+    const move = (points) => points.map((p) => ({ x: p.x + dx, y: p.y + dy }));
+    if (part.kind === "platform") {
+      return { k: "platform", shapeType: part.shapeType, raw: move(visual) };
+    }
+    return {
+      k: part.kind,
+      shapeType: part.shapeType,
+      behaviorText: part.behaviorText,
+      hue: part.hue,
+      wellRadius: part.wellRadius,
+      spiralDir: part.spiralDir,
+      v: move(visual),
+      s: move(shape)
+    };
+  });
+
+  if (grabbed && grabbed.obj === merged) releaseGrab();
+  if (h2.grab && h2.grab.obj === merged) releaseGrab2();
+  removeObject(merged);
+  const created = [];
+  for (const item of data) {
+    if (deserObj(item)) {
+      const object = objects[objects.length - 1];
+      created.push(object);
+      sendObjectCreation(object);
+    }
+  }
+  if (created[0] && pen) startGrab(created[0]);
+  if (created[1] && h2.pen) startGrab2(created[1]);
+  for (const target of targets) if (target) spawnSparks(target.x, target.y, 16);
+  showToast("Split into two objects");
+  syncButtons();
+}
+
+function checkMergeAndDemerge(nowMs) {
+  if (grabbed && h2.grab && grabbed.obj === h2.grab.obj && grabbed.obj.isMerged) {
+    mergeCandidate = null;
+    mergeProgress = 0;
+    const first = penVis || pen, second = h2.vis || h2.pen;
+    if (!first || !second) return;
+    const distance = dist(first, second);
+    if (!demergeCandidate || demergeCandidate.obj !== grabbed.obj) {
+      demergeCandidate = { obj: grabbed.obj, minDist: distance };
+    } else {
+      demergeCandidate.minDist = Math.min(demergeCandidate.minDist, distance);
+      demergeProgress = Math.min(1, Math.max(0, distance - demergeCandidate.minDist - 10) / Math.max(1, DEMERGE_PULL_TOL - 10));
+      if (demergeProgress >= 1) {
+        const target = grabbed.obj;
+        demergeCandidate = null;
+        demergeProgress = 0;
+        mergeCooldownUntil = nowMs + 1000;
+        demergeObject(target);
+      }
+    }
+    return;
+  }
+  demergeCandidate = null;
+  demergeProgress = 0;
+
+  const a = grabbed && grabbed.obj;
+  const b = h2.grab && h2.grab.obj;
+  if (!a || !b || a === b || !canEditObject(a) || !canEditObject(b) || a.isMerged || b.isMerged || nowMs < mergeCooldownUntil) {
+    mergeCandidate = null;
+    mergeProgress = 0;
+    return;
+  }
+  const gap = getObjectsEdgeGap(a, b);
+  if (gap > MERGE_PROXIMITY_PX) {
+    mergeCandidate = null;
+    mergeProgress = 0;
+    return;
+  }
+  const posA = a.body ? a.body.position : a.bodies[0].position;
+  const posB = b.body ? b.body.position : b.bodies[0].position;
+  if (!mergeCandidate || mergeCandidate.objA !== a || mergeCandidate.objB !== b) {
+    mergeCandidate = { objA: a, objB: b, startMs: nowMs };
+  }
+  mergeCandidate.midX = (posA.x + posB.x) / 2;
+  mergeCandidate.midY = (posA.y + posB.y) / 2;
+  mergeProgress = Math.min(1, (nowMs - mergeCandidate.startMs) / MERGE_HOLD_MS);
+
+  if (!pausedWorld && a.body && !a.body.isStatic && b.body && !b.body.isStatic) {
+    const distance = Math.max(1, dist(posA, posB));
+    const force = 0.003 * mergeProgress;
+    const nx = (posB.x - posA.x) / distance, ny = (posB.y - posA.y) / distance;
+    Body.applyForce(a.body, a.body.position, { x: nx * force, y: ny * force });
+    Body.applyForce(b.body, b.body.position, { x: -nx * force, y: -ny * force });
+  }
+  if (mergeProgress >= 1) {
+    mergeObjects(a, b);
+    mergeCandidate = null;
+    mergeProgress = 0;
+    mergeCooldownUntil = nowMs + 1000;
   }
 }
 
@@ -365,6 +735,71 @@ function addSolid(raw, poly, shapeLabel, behaviorLabel) {
     local: local,
     polyLocal: polyLocal,
     simple: poly,
+    origin: { x: body.position.x, y: body.position.y, angle: body.angle },
+    born: performance.now()
+  });
+  return true;
+}
+
+function addCompoundObject(components) {
+  if (!Array.isArray(components) || components.length < 2) return false;
+  const parts = [];
+  for (const component of components) {
+    const shape = component.s || component.v || [];
+    const isOpen = ["platform", "line", "cup", "spring", "spiral"].includes(component.k);
+    if (isOpen && shape.length >= 2) {
+      for (let i = 0; i < shape.length - 1; i++) {
+        const a = shape[i], b = shape[i + 1];
+        const length = dist(a, b);
+        if (length < 2) continue;
+        parts.push(Bodies.rectangle(
+          (a.x + b.x) / 2,
+          (a.y + b.y) / 2,
+          length + PLATFORM_THICK * 0.5,
+          PLATFORM_THICK,
+          { angle: Math.atan2(b.y - a.y, b.x - a.x), friction: 0.5, restitution: 0.3 }
+        ));
+      }
+    } else if (shape.length >= 3) {
+      const body = buildBody(shape);
+      if (bodyIsOk(body)) parts.push(body);
+    }
+  }
+  if (parts.length < 2) return false;
+  const body = Body.create({ parts: parts, friction: 0.4, restitution: 0.35 });
+  if (!bodyIsOk(body)) return false;
+
+  const c = Math.cos(-body.angle), s = Math.sin(-body.angle);
+  const toLocal = (points) => (points || []).map((p) => {
+    const dx = p.x - body.position.x, dy = p.y - body.position.y;
+    return { x: dx * c - dy * s, y: dx * s + dy * c };
+  });
+  const subParts = components.map((component) => ({
+    kind: component.k,
+    shapeType: component.shapeType,
+    behaviorText: component.behaviorText,
+    hue: component.hue,
+    wellRadius: component.wellRadius,
+    spiralDir: component.spiralDir,
+    local: toLocal(component.v),
+    polyLocal: toLocal(component.s || component.v)
+  }));
+  const local = subParts.flatMap((part) => part.local);
+  const polyLocal = subParts.flatMap((part) => part.polyLocal);
+
+  Composite.add(world, body);
+  objects.push({
+    kind: "compound",
+    shapeType: "Merged",
+    behaviorText: "Fused Compound",
+    isMerged: true,
+    scaleMultiplier: 1,
+    hue: Math.round(subParts.reduce((sum, part) => sum + (part.hue || 190), 0) / subParts.length),
+    bodies: [body],
+    body: body,
+    local: local,
+    polyLocal: polyLocal,
+    subParts: subParts,
     origin: { x: body.position.x, y: body.position.y, angle: body.angle },
     born: performance.now()
   });
@@ -595,7 +1030,8 @@ function addFallingLine(raw, line, shapeLabel) {
 }
 
 // Both Hand 1, Hand 2, and the mouse send their finished strokes here.
-function commitStroke(points) {
+function commitStroke(points, fromNetwork = false, ownerId = null, objectId = null, color = null) {
+  const sourcePoints = points.slice();
   points = smoothStroke(points, 2);
   const len = pathLength(points);
   if (points.length < MIN_STROKE_POINTS || len < MIN_STROKE_LENGTH) {
@@ -608,6 +1044,7 @@ function commitStroke(points) {
   const isSnapped = !!(classified && classified.snapPoints && classified.snapPoints.length >= 2);
   const visual = isSnapped ? classified.snapPoints : freeformVisual;
   let made = false;
+  const objectCount = objects.length;
 
   if (classified.type === "circle") {
     made = addCircleObject(visual, classified.data);
@@ -647,6 +1084,7 @@ function commitStroke(points) {
     const ok = linesFall
       ? addFallingLine(visual, line, label)
       : addPlatform(visual, line, label);
+    made = ok;
     if (ok) {
       if (isSnapped) {
         const beh = linesFall ? "Falling Rod" : "Fixed Ramp";
@@ -662,6 +1100,20 @@ function commitStroke(points) {
       cancelled++;
     }
   }
+  if (made && objects.length > objectCount) {
+    const o = objects[objects.length - 1];
+    if (fromNetwork) {
+      o.ownerId = ownerId;
+      o.objectId = objectId;
+      if (isValidDrawingColor(color)) o.color = color;
+    } else {
+      o.color = drawingColor;
+      assignLocalObjectIdentity(o);
+      if (typeof window.broadcastStroke === "function") {
+        window.broadcastStroke(sourcePoints, o.ownerId, o.objectId, o.color);
+      }
+    }
+  }
   trimObjects();
 }
 
@@ -669,6 +1121,9 @@ function spawnTestBall(x, y) {
   const r = 26;
   const pts = window.makeCirclePoints({ x: x, y: y }, r, 24);
   addCircleObject(pts, { center: { x: x, y: y }, radius: r, poly: pts });
+  objects[objects.length - 1].color = drawingColor;
+  assignLocalObjectIdentity(objects[objects.length - 1]);
+  sendObjectCreation(objects[objects.length - 1]);
   trimObjects();
 }
 
@@ -713,12 +1168,13 @@ function shiftStatic(o, dx, dy) {
 
 // Hand 1 Grab functions
 function startGrab(o) {
-  if (!o || !pen) return;
-  if (h2.grab && h2.grab.obj === o) return;
+  if (!o || !pen || !canEditObject(o)) return;
+  if (h2.grab && h2.grab.obj === o && !o.isMerged) return;
   returns = returns.filter((r) => r.obj !== o);
   if (o.body && !o.body.isStatic) {
-    const origMass = o.body.mass;
-    Body.setMass(o.body, origMass * GRAB_MASS_MULT);
+    const heldByHand2 = h2.grab && h2.grab.obj === o;
+    const origMass = heldByHand2 ? 0 : o.body.mass;
+    if (!heldByHand2) Body.setMass(o.body, origMass * GRAB_MASS_MULT);
     grabbed = {
       obj: o,
       dynamic: true,
@@ -767,17 +1223,19 @@ function releaseGrab() {
   } else if (Math.hypot(g.totalDx || 0, g.totalDy || 0) > 8) {
     lastMoved = g.obj;
   }
+  sendObjectMove(g.obj, true);
   if (typeof syncButtons === "function") syncButtons();
 }
 
 // Hand 2 Grab functions (completely independent and symmetric with Hand 1)
 function startGrab2(o) {
-  if (!o || !h2.pen) return;
-  if (grabbed && grabbed.obj === o) return;
+  if (!o || !h2.pen || !canEditObject(o)) return;
+  if (grabbed && grabbed.obj === o && !o.isMerged) return;
   returns = returns.filter((r) => r.obj !== o);
   if (o.body && !o.body.isStatic) {
-    const origMass = o.body.mass;
-    Body.setMass(o.body, origMass * GRAB_MASS_MULT);
+    const heldByHand1 = grabbed && grabbed.obj === o;
+    const origMass = heldByHand1 ? 0 : o.body.mass;
+    if (!heldByHand1) Body.setMass(o.body, origMass * GRAB_MASS_MULT);
     h2.grab = {
       obj: o,
       dynamic: true,
@@ -830,6 +1288,7 @@ function releaseGrab2() {
   } else if (Math.hypot(k.totalDx || 0, k.totalDy || 0) > 8) {
     lastMoved = k.obj;
   }
+  sendObjectMove(k.obj, true);
   if (typeof syncButtons === "function") syncButtons();
 }
 
@@ -871,6 +1330,19 @@ function driveGrabbedDynamic() {
     return;
   }
   const b = grabbed.obj.body;
+  if (h2.grab && h2.grab.obj === grabbed.obj && grabbed.obj.isMerged) {
+    const p1 = penVis || pen;
+    const p2 = h2.vis || h2.pen;
+    if (p1 && p2) {
+      const vx = ((p1.x + p2.x) / 2 - b.position.x) * 0.35;
+      const vy = ((p1.y + p2.y) / 2 - b.position.y) * 0.35;
+      Body.setVelocity(b, { x: vx, y: vy });
+      const targetAngle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+      Body.setAngle(b, b.angle + angDiff(targetAngle, b.angle) * 0.15);
+      sendObjectMove(grabbed.obj);
+      return;
+    }
+  }
   const pv = penVis || pen;
   let vx = (pv.x + grabbed.offX - b.position.x) * 0.3;
   let vy = (pv.y + grabbed.offY - b.position.y) * 0.3;
@@ -880,8 +1352,12 @@ function driveGrabbedDynamic() {
   grabbed.cvy = grabbed.cvy === undefined ? vy : grabbed.cvy + (vy - grabbed.cvy) * 0.55;
   Body.setVelocity(b, { x: grabbed.cvx, y: grabbed.cvy });
   rotateHeld(b, grabbed, handAng);
+  sendObjectMove(grabbed.obj);
   for (const o of platformsPushed) {
-    if (objects.includes(o) && (!o.pinned || pushFrozen)) shiftStatic(o, grabbed.cvx, grabbed.cvy);
+    if (objects.includes(o) && (!o.pinned || pushFrozen)) {
+      shiftStatic(o, grabbed.cvx, grabbed.cvy);
+      sendObjectMove(o);
+    }
   }
   platformsPushed.clear();
 }
@@ -889,6 +1365,7 @@ function driveGrabbedDynamic() {
 function driveGrab2() {
   const k = h2.grab;
   if (!k || !h2.pen) return;
+  if (grabbed && grabbed.obj === k.obj) return;
   if (!objects.includes(k.obj)) {
     h2.grab = null;
     return;
@@ -904,8 +1381,12 @@ function driveGrab2() {
   k.cvy = k.cvy === undefined ? vy : k.cvy + (vy - k.cvy) * 0.55;
   Body.setVelocity(b, { x: k.cvx, y: k.cvy });
   rotateHeld(b, k, h2.ang);
+  sendObjectMove(k.obj);
   for (const o of platformsPushed2) {
-    if (objects.includes(o) && (!o.pinned || pushFrozen)) shiftStatic(o, k.cvx, k.cvy);
+    if (objects.includes(o) && (!o.pinned || pushFrozen)) {
+      shiftStatic(o, k.cvx, k.cvy);
+      sendObjectMove(o);
+    }
   }
   platformsPushed2.clear();
 }
@@ -923,6 +1404,7 @@ function moveGrabbedStatic() {
       shiftStatic(grabbed.obj, dx, dy);
       grabbed.totalDx = (grabbed.totalDx || 0) + dx;
       grabbed.totalDy = (grabbed.totalDy || 0) + dy;
+      sendObjectMove(grabbed.obj);
     }
   }
   if (h2.grab && h2.grab.st && h2.pen) {
@@ -936,14 +1418,16 @@ function moveGrabbedStatic() {
       shiftStatic(h2.grab.obj, dx2, dy2);
       h2.grab.totalDx = (h2.grab.totalDx || 0) + dx2;
       h2.grab.totalDy = (h2.grab.totalDy || 0) + dy2;
+      sendObjectMove(h2.grab.obj);
     }
   }
 }
 
 function toggleSelect(o, triggerPoint) {
+  if (!o) return;
   if (selected.has(o)) {
     selected.delete(o);
-    unpinObject(o);
+    if (canEditObject(o)) unpinObject(o);
   } else {
     selected.add(o);
     lastSelectMs = performance.now();
@@ -956,7 +1440,9 @@ function toggleSelect(o, triggerPoint) {
 }
 
 function clearSelection() {
-  for (const o of selected) unpinObject(o);
+  for (const o of selected) {
+    if (canEditObject(o)) unpinObject(o);
+  }
   selected.clear();
   if (typeof syncButtons === "function") syncButtons();
 }
@@ -965,7 +1451,7 @@ function clearSelection() {
 function updateHoverSelect(nowMs) {
   // Hand 1 Hover Select
   let obj1 = null;
-  const overBtn1 = (typeof buttonAt === "function" && showBar && pen) ? buttonAt(pen) : null;
+  const overBtn1 = (typeof toolbarPanelAt === "function" && showBar && pen) ? toolbarPanelAt(pen) : null;
   if (pen && !pinching && !grabbed && !overBtn1 && !(candPose && candPose !== "OPEN PALM")) {
     obj1 = objectAtPoint(pen);
   }
@@ -984,7 +1470,7 @@ function updateHoverSelect(nowMs) {
 
   // Hand 2 Hover Select
   let obj2 = null;
-  const overBtn2 = (typeof buttonAt === "function" && showBar && h2.pen) ? buttonAt(h2.pen) : null;
+  const overBtn2 = (typeof toolbarPanelAt === "function" && showBar && h2.pen) ? toolbarPanelAt(h2.pen) : null;
   if (h2.pen && !h2.pinching && !h2.grab && !overBtn2 && !(h2.candPose && h2.candPose !== "OPEN PALM")) {
     obj2 = objectAtPoint(h2.pen);
   }
@@ -1014,6 +1500,11 @@ function clearMoves() {
   h2.grabCandidate = null;
   tabHold = null;
   h2.tabHold = null;
+  mergeCandidate = null;
+  mergeProgress = 0;
+  demergeCandidate = null;
+  demergeProgress = 0;
+  scaleSession = null;
   lastMoved = null;
   returns = [];
   if (typeof syncButtons === "function") syncButtons();
@@ -1059,8 +1550,8 @@ function startReturn(o) {
 function reverseMove() {
   const targets = [];
   if (selected.size > 0) {
-    for (const o of selected) targets.push(o);
-  } else if (lastMoved && objects.includes(lastMoved)) {
+    for (const o of selected) if (canEditObject(o)) targets.push(o);
+  } else if (lastMoved && objects.includes(lastMoved) && canEditObject(lastMoved)) {
     targets.push(lastMoved);
     selected.add(lastMoved);
   }
@@ -1091,7 +1582,10 @@ function updateReturns(nowMs) {
       shiftStatic(r.obj, r.dx * d, r.dy * d);
       r.ePrev = e;
     }
-    if (t >= 1) returns.splice(i, 1);
+    sendObjectMove(r.obj, t >= 1);
+    if (t >= 1) {
+      returns.splice(i, 1);
+    }
   }
 }
 
@@ -1120,13 +1614,18 @@ function setFloating(o, on) {
 }
 
 function floatSelected(mode) {
-  const targets = Array.from(selected).filter((o) => objects.includes(o) && o.body && o.kind !== "spiral");
+  const targets = Array.from(selected).filter((o) =>
+    objects.includes(o) && canEditObject(o) && o.body && o.kind !== "spiral"
+  );
   if (targets.length === 0) {
     if (typeof showToast === "function") showToast("Select a movable object first");
     return;
   }
   const on = mode === "on" ? true : (mode === "off" ? false : !targets.every((o) => o.floating));
-  for (const o of targets) setFloating(o, on);
+  for (const o of targets) {
+    setFloating(o, on);
+    sendObjectMove(o);
+  }
   if (typeof showToast === "function") showToast(on ? "Floating" : "Falling");
   if (typeof syncButtons === "function") syncButtons();
 }
@@ -1161,13 +1660,14 @@ function shatter(o) {
       vy: Math.sin(a) * sp - 1.5,
       life: 0,
       max: 40 + Math.random() * 35,
-      hue: o.hue
+      hue: o.hue,
+      color: o.color
     });
   }
 }
 
 function destroySelected() {
-  const targets = Array.from(selected).filter((o) => objects.includes(o));
+  const targets = Array.from(selected).filter((o) => objects.includes(o) && canEditObject(o));
   if (targets.length === 0) {
     if (typeof showToast === "function") showToast("Select an object first");
     return;
@@ -1186,6 +1686,28 @@ function destroySelected() {
 function cloneObject(o) {
   const W = canvas.width;
   const H = canvas.height;
+  if (o.isMerged) {
+    const data = serObj(o);
+    const points = data.components.flatMap((part) => part.v || []);
+    const bb = boundsOf(points);
+    const dx = bb.maxX + 44 > W ? -44 : 44;
+    const dy = bb.maxY + 44 > H - 4 ? -44 : 44;
+    const move = (arr) => (arr || []).map((point) => ({ x: point.x + dx, y: point.y + dy }));
+    const components = data.components.map((part) => ({
+      ...part,
+      v: move(part.v),
+      s: move(part.s)
+    }));
+    const made = addCompoundObject(components);
+    if (made) {
+      const clone = objects[objects.length - 1];
+      clone.hue = o.hue;
+      clone.scaleMultiplier = o.scaleMultiplier || 1;
+      assignLocalObjectIdentity(clone);
+      sendObjectCreation(clone);
+    }
+    return made;
+  }
   let visual = null;
   let shape = null;
   if (o.kind === "platform") {
@@ -1237,7 +1759,13 @@ function cloneObject(o) {
   } else {
     made = addPlatform(visual, simplifyCapped(visual, PLATFORM_EPSILON, MAX_SEGMENTS + 1), o.shapeType);
   }
-  if (made) objects[objects.length - 1].hue = o.hue;
+  if (made) {
+    const clone = objects[objects.length - 1];
+    clone.hue = o.hue;
+    clone.color = o.color;
+    assignLocalObjectIdentity(clone);
+    sendObjectCreation(clone);
+  }
   return made;
 }
 
@@ -1289,11 +1817,13 @@ function driveHeldPaused() {
   if (grabbed && grabbed.dynamic && objects.includes(grabbed.obj) && grabbed.obj.body && (penVis || pen)) {
     const pv = penVis || pen;
     follow(grabbed.obj.body, grabbed, pv.x + grabbed.offX, pv.y + grabbed.offY, handAng);
+    sendObjectMove(grabbed.obj);
   }
   const k2 = h2.grab;
   if (k2 && !k2.st && h2.pen && objects.includes(k2.obj) && k2.obj.body) {
     const pv2 = h2.vis || h2.pen;
     follow(k2.obj.body, k2, pv2.x + k2.offX, pv2.y + k2.offY, h2.ang);
+    sendObjectMove(k2.obj);
   }
 }
 
