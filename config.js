@@ -5,7 +5,7 @@
 const PINCH_START = 0.28;      // pinch begins when thumb-index distance is below this fraction of hand size
 const PINCH_STOP = 0.45;       // pinch ends when it goes above this fraction (bigger than start = no flicker)
 const DEBOUNCE_FRAMES = 2;     // frames a pinch must hold before it counts
-const MIN_POINT_GAP = 2.5;     // pixels the pen must move before a new point is added
+const MIN_POINT_GAP = 5.0;     // pixels the pen must move before a new point is added
 const MIN_STROKE_POINTS = 6;   // shorter strokes are treated as false pinches and deleted
 const MIN_STROKE_LENGTH = 40;  // pixels, strokes shorter than this are deleted
 const DROPOUT_END_MS = 200;    // if the hand disappears this long during a stroke, end the stroke
@@ -43,6 +43,9 @@ let GRAB_HOLD_MS = 700;        // hold still this long to pick the object up
 const GRAB_MOVE_TOL = 22;      // pixels; moving more than this before the time is up means you are drawing instead
 let GRAB_MASS_MULT = 40;       // the object you hold counts as this many times heavier, so it pushes other objects instead of being blocked by them
 const GRAB_PICK_RADIUS = 16;   // pixels; how close the pen must be to an object (helps with thin lines)
+const MERGE_PROXIMITY_PX = 80;
+const MERGE_HOLD_MS = 650;
+const DEMERGE_PULL_TOL = 45;
 let MAX_THROW = 35;            // limit on the speed an object keeps when you let go
 const RETURN_MS = 500;         // how long the Reverse animation takes
 let SELECT_HOLD_MS = 800;      // hold the ring (not pinching) over an object this long to select or unselect it
@@ -108,7 +111,9 @@ const ICONS = {
   panel:    { d: "M4 5h16v14h-16z M14 5v14" },
   side:     { d: "M7 8l-4 4 4 4 M17 8l4 4-4 4 M3 12h18" },
   reach:    { d: "M4 14v6h6 M20 10v-6h-6 M4 20l7-7 M20 4l-7 7" },
-  help:     { d: "M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0 M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.4-1 1-1 1.7 M12 17.2v.1" }
+  help:     { d: "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0 M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.4-1 1-1 1.7 M12 17.2v.1" },
+  mic:      { d: "M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3 M19 10v1a7 7 0 0 1-14 0v-1 M12 18v4 M8 22h8" },
+  micOff:   { d: "M9 9v2a3 3 0 0 0 5.1 2.1 M15 9V5a3 3 0 0 0-5.8-1 M19 10v1a7 7 0 0 1-11.6 5.3 M12 18v4 M8 22h8 M3 3l18 18" }
 };
 
 // ------------------------------------------------------------
@@ -142,6 +147,11 @@ let showSkeleton = true;
 let showHitboxes = false;
 let gravityOn = true;
 let showLabels = true;
+let drawingColor = "#5dffa8";
+
+function isValidDrawingColor(color) {
+  return typeof color === "string" && /^#[0-9a-f]{6}$/i.test(color);
+}
 
 // ------------------------------------------------------------
 // State (Hand 1 + Independent Hand 2 + Shared World State)
