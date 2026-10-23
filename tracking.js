@@ -1,1016 +1,2069 @@
 // ------------------------------------------------------------
-// Camera, MediaPipe Hand Tracker, Gestures, and Mouse Input
+// Safe cross-file fallbacks so ui.js never crashes regardless
+// of script load order or cached files
 // ------------------------------------------------------------
+if (typeof window.PREDICT_GAP_MS === "undefined") window.PREDICT_GAP_MS = 110;
+if (typeof window.CIRCLE_CLOSE_RATIO === "undefined") window.CIRCLE_CLOSE_RATIO = 0.32;
+if (typeof window.CIRCLE_MIN_METRIC === "undefined") window.CIRCLE_MIN_METRIC = 0.70;
+if (typeof window.CIRCLE_MAX_RAD_ERR === "undefined") window.CIRCLE_MAX_RAD_ERR = 0.22;
+if (typeof window.ZIGZAG_MIN_TURNS === "undefined") window.ZIGZAG_MIN_TURNS = 3;
+if (typeof window.ZIGZAG_MIN_ANGLE === "undefined") window.ZIGZAG_MIN_ANGLE = 0.65;
+if (typeof window.LABEL_SHOW_MS === "undefined") window.LABEL_SHOW_MS = 3200;
+if (typeof window.showLabels === "undefined") window.showLabels = true;
 
-// Ensure Shaka pose timings and actions are registered even if config.js is cached
-if (typeof POSE_HOLD_MS !== "undefined") {
-  if (!POSE_HOLD_MS["SHAKA UP"]) POSE_HOLD_MS["SHAKA UP"] = 500;
-  if (!POSE_HOLD_MS["SHAKA DOWN"]) POSE_HOLD_MS["SHAKA DOWN"] = 500;
-}
-if (typeof GESTURE_ACTIONS !== "undefined") {
-  if (!GESTURE_ACTIONS["SHAKA UP"]) GESTURE_ACTIONS["SHAKA UP"] = "selectAll";
-  if (!GESTURE_ACTIONS["SHAKA DOWN"]) GESTURE_ACTIONS["SHAKA DOWN"] = "deselect";
-}
-
-// ------------------------------------------------------------
-// Camera and tracker setup
-// ------------------------------------------------------------
-const TOOLBAR_DRAG_SLOP = 28;
-let h1ToolbarTouch = null;
-let h2ToolbarTouch = null;
-let mouseToolbarTouch = null;
-
-// Turns a camera error into a plain-language message.
-function explainCameraError(err) {
-  const name = err && err.name ? err.name : "";
-  let msg;
-  if (name === "NeedsSecure") {
-    msg = "The camera only works on a secure page (localhost or https).";
-  } else if (name === "NotAllowedError" || name === "SecurityError") {
-    msg = "Camera permission was blocked. Click the camera icon in the address bar, choose Allow, then reload.";
-  } else if (name === "NotFoundError" || name === "OverconstrainedError") {
-    msg = "No usable camera was found.";
-  } else if (name === "NotReadableError" || name === "AbortError") {
-    msg = "The camera is busy or was shut down. Close other tabs or apps that use the camera " +
-      "(an older copy of this page, Zoom, Teams, the Camera app), then reload.";
-  } else {
-    msg = "Camera error: " + (err && err.message ? err.message : name);
-  }
-  if (location.protocol === "file:") {
-    msg += " Tip: do not open this file straight from the folder. Open it with Live Server (http://localhost) instead.";
-  }
-  return msg;
-}
-
-async function openCameraStream() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    const e = new Error("no mediaDevices");
-    e.name = "NeedsSecure";
-    throw e;
-  }
-  const wanted = {
-    video: {
-      facingMode: "user",
-      width: { ideal: 960 },
-      height: { ideal: 540 },
-      frameRate: { ideal: 60 }
-    },
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true
-    }
-  };
+function getShowLabels() {
   try {
-    return await navigator.mediaDevices.getUserMedia(wanted);
-  } catch (err) {
-    // Preserve video when microphone permission or audio capture is unavailable.
-    if (err.name === "NotReadableError" || err.name === "AbortError" || err.name === "OverconstrainedError") {
-      await new Promise((resolve) => setTimeout(resolve, 900));
-    }
-    return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    if (typeof showLabels !== "undefined") return showLabels;
+  } catch (e) {
+    // ignore
+  }
+  return window.showLabels !== false;
+}
+
+function setShowLabels(val) {
+  window.showLabels = !!val;
+  try {
+    if (typeof showLabels !== "undefined") showLabels = !!val;
+  } catch (e) {
+    // ignore
   }
 }
 
-// Let go of the camera when the page closes, so the next copy of the page can use it.
-window.addEventListener("pagehide", () => {
-  const st = video.srcObject;
-  if (st) st.getTracks().forEach((t) => t.stop());
+const drawingColorInput = document.getElementById("drawingColor");
+if (drawingColorInput) {
+  drawingColorInput.addEventListener("input", () => {
+    drawingColor = drawingColorInput.value;
+    saveSettings();
+  });
+}
+
+if (typeof window.smoothCurve !== "function") {
+  window.smoothCurve = function (points) {
+    if (!points || points.length < 3) return points || [];
+    const out = [points[0]];
+    for (let i = 0; i < points.length - 1; i++) {
+      const p0 = points[Math.max(0, i - 1)];
+      const p1 = points[i];
+      const p2 = points[i + 1];
+      const p3 = points[Math.min(points.length - 1, i + 2)];
+      const d = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+      const steps = Math.min(4, Math.max(1, Math.floor(d / 8)));
+      for (let s = 1; s <= steps; s++) {
+        const t = s / steps;
+        const t2 = t * t;
+        const t3 = t2 * t;
+        const x = 0.5 * (
+          (2 * p1.x) +
+          (-p0.x + p2.x) * t +
+          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3
+        );
+        const y = 0.5 * (
+          (2 * p1.y) +
+          (-p0.y + p2.y) * t +
+          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3
+        );
+        out.push({ x: x, y: y });
+      }
+    }
+    return out;
+  };
+}
+
+if (typeof window.makeCirclePoints !== "function") {
+  window.makeCirclePoints = function (center, radius, count = 32) {
+    const pts = [];
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2;
+      pts.push({
+        x: center.x + Math.cos(a) * radius,
+        y: center.y + Math.sin(a) * radius
+      });
+    }
+    return pts;
+  };
+}
+
+// ------------------------------------------------------------
+// Populate SVG icons on the toolbar buttons
+// ------------------------------------------------------------
+function initToolbarIcons() {
+  if (typeof ICONS === "undefined") return;
+  document.querySelectorAll("[data-icon]").forEach((btn) => {
+    const ic = ICONS[btn.dataset.icon];
+    const svg = btn.querySelector("svg");
+    if (!ic || !svg) return;
+    svg.innerHTML = "";
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", ic.d);
+    if (ic.dash) path.setAttribute("stroke-dasharray", ic.dash);
+    svg.appendChild(path);
+  });
+}
+initToolbarIcons();
+
+const videoStage = document.getElementById("wrap");
+const videoLayoutButtons = Array.from(document.querySelectorAll("[data-video-layout]"));
+const videoFocusToggle = document.getElementById("videoFocusToggle");
+let activeVideoLayout = "pip";
+let focusedVideo = "local";
+
+function updateVideoLayout() {
+  if (!videoStage) return;
+  videoStage.dataset.layout = activeVideoLayout;
+  videoStage.dataset.focus = focusedVideo;
+  for (const button of videoLayoutButtons) {
+    button.setAttribute("aria-pressed", String(button.dataset.videoLayout === activeVideoLayout));
+  }
+  if (videoFocusToggle) {
+    videoFocusToggle.textContent = focusedVideo === "local" ? "Show partner" : "Show me";
+    videoFocusToggle.setAttribute("aria-label", focusedVideo === "local"
+      ? "Show partner video full screen"
+      : "Show your video full screen");
+  }
+}
+
+for (const button of videoLayoutButtons) {
+  button.addEventListener("click", () => {
+    activeVideoLayout = button.dataset.videoLayout;
+    if (activeVideoLayout === "focus") focusedVideo = "local";
+    updateVideoLayout();
+  });
+}
+
+if (videoFocusToggle) {
+  videoFocusToggle.addEventListener("click", () => {
+    focusedVideo = focusedVideo === "local" ? "remote" : "local";
+    updateVideoLayout();
+  });
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeVideoLayout === "focus" && focusedVideo === "remote") {
+    focusedVideo = "local";
+    updateVideoLayout();
+  }
 });
 
-async function startCamera() {
-  let stream;
-  try {
-    stream = await openCameraStream();
-  } catch (err) {
-    err.friendly = explainCameraError(err);
-    throw err;
+updateVideoLayout();
+
+// ------------------------------------------------------------
+// Drawing on the overlay canvas
+// ------------------------------------------------------------
+function buildPath(points) {
+  if (!points || points.length === 0) return;
+  ctx.beginPath();
+  ctx.moveTo(points[0].x, points[0].y);
+  for (let i = 1; i < points.length - 1; i++) {
+    const mx = (points[i].x + points[i + 1].x) / 2;
+    const my = (points[i].y + points[i + 1].y) / 2;
+    ctx.quadraticCurveTo(points[i].x, points[i].y, mx, my);
   }
-  window.localAudioAvailable = stream.getAudioTracks().some((track) => track.readyState === "live");
-  video.muted = true;
-  video.playsInline = true;
-  video.setAttribute("muted", "");
-  video.setAttribute("playsinline", "");
-  video.srcObject = stream;
-  window.dispatchEvent(new Event("local-media-ready"));
-  try {
-    await video.play();
-  } catch (playError) {
-    console.warn("video.play() autoplay notice:", playError);
-  }
-  if (!video.videoWidth || video.readyState < 2) {
-    await new Promise((resolve) => {
-      let timer;
-      const finish = () => {
-        clearTimeout(timer);
-        resolve();
-      };
-      video.addEventListener("loadedmetadata", finish, { once: true });
-      video.addEventListener("canplay", finish, { once: true });
-      timer = setTimeout(finish, 1200);
-    });
-  }
-  canvas.width = video.videoWidth || 960;
-  canvas.height = video.videoHeight || 540;
+  const lastP = points[points.length - 1];
+  ctx.lineTo(lastP.x, lastP.y);
 }
 
-async function startTracker() {
-  const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
-  const { HandLandmarker, FilesetResolver } = vision;
-  const fileset = await FilesetResolver.forVisionTasks(
-    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+// Neon glow made from three layered strokes. Much cheaper than shadowBlur, so it stays smooth.
+function neonStroke(glow, core, wide) {
+  ctx.globalAlpha = 0.16;
+  ctx.lineWidth = wide + 12;
+  ctx.strokeStyle = glow;
+  ctx.stroke();
+  ctx.globalAlpha = 0.3;
+  ctx.lineWidth = wide + 5;
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+  ctx.lineWidth = wide;
+  ctx.strokeStyle = core;
+  ctx.stroke();
+}
+
+// New drawings pop in: they start slightly small and settle to full size.
+// Also handles spring boing oscillation and impact squash-and-stretch.
+var POP_MS = 260;
+function popScaled(o, pts) {
+  if (!pts || pts.length === 0) return [];
+  const now = performance.now();
+  const age = now - (o.born || 0);
+  let sx = 1;
+  let sy = 1;
+
+  if (age >= 0 && age < POP_MS) {
+    const t = age / POP_MS;
+    const sc = 0.55 + 0.45 * (1 - Math.pow(1 - t, 3)) + 0.08 * Math.sin(t * Math.PI);
+    sx *= sc;
+    sy *= sc;
+  }
+
+  // Spring boing oscillation when a Zigzag Spring is triggered
+  if (o.kind === "spring" && o.boingUntil && now < o.boingUntil) {
+    const rem = (o.boingUntil - now) / 480;
+    const wave = Math.sin(now * 0.045) * 0.28 * rem;
+    sx *= (1 - wave * 0.6);
+    sy *= (1 + wave);
+  }
+
+  // Impact squash and stretch
+  if (o.impactAt && now - o.impactAt < 220) {
+    const k = 1 - (now - o.impactAt) / 220;
+    const w = Math.sin((1 - k) * Math.PI * 2) * (o.impactStrength || 0.12) * k;
+    sx *= (1 + w);
+    sy *= (1 - w);
+  }
+
+  if (sx === 1 && sy === 1) return pts;
+
+  let cx;
+  let cy;
+  if (o.body) {
+    cx = o.body.position.x;
+    cy = o.body.position.y;
+  } else {
+    const bb = boundsOf(pts);
+    cx = (bb.minX + bb.maxX) / 2;
+    cy = (bb.minY + bb.maxY) / 2;
+  }
+  return pts.map((p) => ({
+    x: cx + (p.x - cx) * sx,
+    y: cy + (p.y - cy) * sy
+  }));
+}
+
+// Floating badge above identified objects (or any object when hovered/selected/grabbed)
+function drawObjectLabel(o, pts) {
+  if (!getShowLabels() || !o || !o.shapeType || !pts || pts.length === 0) return;
+  const now = performance.now();
+  const age = now - (o.born || 0);
+  const selSet = typeof selected !== "undefined" ? selected : null;
+  const isHot = (selSet && selSet.has(o)) || hoverObj === o || (grabbed && grabbed.obj === o) ||
+    (typeof h2 !== "undefined" && (h2.hoverObj === o || (h2.grab && h2.grab.obj === o)));
+
+  // For generic freeform Blobs and Lines, only show the label when hovered, selected, or held
+  const isGeneric = o.shapeType === "Blob" || o.shapeType === "Line";
+  if (isGeneric && !isHot) return;
+
+  const maxAge = window.LABEL_SHOW_MS || 3200;
+  if (!isHot && age > maxAge) return;
+
+  let alpha = 1;
+  if (!isHot && age > maxAge - 600) {
+    alpha = Math.max(0, (maxAge - age) / 600);
+  }
+
+  const bb = boundsOf(pts);
+  const cx = (bb.minX + bb.maxX) / 2;
+  const topY = Math.max(24, bb.minY - 14);
+  const text = o.shapeType + " - " + (o.behaviorText || "Object");
+
+  ctx.save();
+  ctx.globalAlpha = alpha * 0.9;
+  ctx.font = "bold 11px Arial";
+  const padX = 8;
+  const h = 20;
+  const w = Math.round(ctx.measureText(text).width + padX * 2);
+  const x = Math.round(cx - w / 2);
+  const y = Math.round(topY - h / 2);
+
+  roundRectPath(x, y, w, h, 10);
+  ctx.fillStyle = "rgba(10, 14, 22, 0.85)";
+  ctx.fill();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = o.color || "hsl(" + (o.hue || 190) + ", 100%, 65%)";
+  ctx.stroke();
+
+  ctx.fillStyle = "#e8f4ff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, cx, y + h / 2 + 0.5);
+  ctx.restore();
+}
+
+let _liveClassifyCache = { time: 0, info: null, len: 0 };
+
+// Live dotted-line shape preview while drawing a stroke.
+// ONLY appears when `info.snapPoints` is non-null (a specific shape was matched).
+function drawLiveShapePreview(rawStroke) {
+  try {
+    if (!rawStroke || typeof smoothStroke !== "function" || typeof pathLength !== "function") return;
+    const minPts = typeof MIN_STROKE_POINTS !== "undefined" ? MIN_STROKE_POINTS : 6;
+    const minLen = typeof MIN_STROKE_LENGTH !== "undefined" ? MIN_STROKE_LENGTH : 40;
+    if (rawStroke.length < minPts) return;
+
+    const smoothed = smoothStroke(rawStroke, 2);
+    if (pathLength(smoothed) < minLen) return;
+    if (typeof classifyShape !== "function") return;
+
+    const now = performance.now();
+    let info = _liveClassifyCache.info;
+    if (now - _liveClassifyCache.time >= 150 || Math.abs(rawStroke.length - _liveClassifyCache.len) > 5) {
+      info = classifyShape(smoothed);
+      _liveClassifyCache = { time: now, info, len: rawStroke.length };
+    }
+    // Do NOT show any dotted preview if this is a normal freeform line or blob (snapPoints === null)
+    if (!info || !info.snapPoints || info.snapPoints.length < 2) return;
+
+    const snap = info.snapPoints;
+    const closed = !!info.closed;
+    const vertices = info.vertices || [];
+
+    const color = drawingColor;
+
+    ctx.save();
+
+    // Animated marching-ants dotted line showing the exact shape it will snap into
+    ctx.beginPath();
+    ctx.moveTo(snap[0].x, snap[0].y);
+    for (let i = 1; i < snap.length; i++) {
+      ctx.lineTo(snap[i].x, snap[i].y);
+    }
+    if (closed) ctx.closePath();
+
+    ctx.setLineDash([6, 6]);
+    ctx.lineDashOffset = -(performance.now() / 28) % 12;
+    ctx.lineWidth = 2.6;
+    ctx.strokeStyle = color;
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Draw small corner dots on snapped geometric vertices (Triangle, Square, Star, Cup, Zigzag, etc.)
+    if (vertices.length > 0 && vertices.length <= 16) {
+      ctx.fillStyle = "#ffffff";
+      for (const v of vertices) {
+        ctx.beginPath();
+        ctx.arc(v.x, v.y, 3.8, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // Draw floating badge above the stroke showing what object it is going to make
+    const bb = boundsOf(snap);
+    const cx = (bb.minX + bb.maxX) / 2;
+    const topY = Math.max(28, bb.minY - 18);
+    const badgeText = "Matching: " + (info.label || "Shape") + " (" + (info.behavior || "Object") + ")";
+
+    ctx.font = "bold 12px Arial";
+    const padX = 10;
+    const h = 22;
+    const w = Math.round(ctx.measureText(badgeText).width + padX * 2);
+    const x = Math.round(Math.max(8, Math.min(canvas.width - w - 8, cx - w / 2)));
+    const y = Math.round(topY - h / 2);
+
+    roundRectPath(x, y, w, h, 11);
+    ctx.fillStyle = "rgba(10, 14, 22, 0.9)";
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = color;
+    ctx.stroke();
+
+    ctx.fillStyle = color;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(badgeText, x + w / 2, y + h / 2 + 0.5);
+    ctx.restore();
+  } catch (err) {
+    ctx.restore();
+  }
+}
+
+function getWorldPointsSafe(o) {
+  if (typeof worldPoints === "function") return worldPoints(o);
+  if (!o || !o.body || !o.local) return (o && o.raw) ? o.raw : [];
+  const b = o.body;
+  const c = Math.cos(b.angle);
+  const s = Math.sin(b.angle);
+  return o.local.map((p) => ({
+    x: b.position.x + p.x * c - p.y * s,
+    y: b.position.y + p.x * s + p.y * c
+  }));
+}
+
+function drawObject(o) {
+  if (!o) return;
+  const held = (grabbed && grabbed.obj === o) || (typeof h2 !== "undefined" && h2.grab && h2.grab.obj === o);
+  const cand = (grabCandidate && grabCandidate.obj === o) || (typeof h2 !== "undefined" && h2.grabCandidate && h2.grabCandidate.obj === o);
+  const glow = held ? "#ffffff" : (o.color || "hsl(" + o.hue + ", 100%, 60%)");
+  const core = o.color ? (held ? "#ffffff" : o.color) : "hsl(" + o.hue + ", 100%, " + (held ? 92 : 78) + "%)";
+  const wide = held ? 6 : (cand ? 5.5 : 4.5);
+  let pts;
+
+  if (o.isMerged && o.subParts && o.body) {
+    const body = o.body;
+    const c = Math.cos(body.angle), s = Math.sin(body.angle);
+    for (const part of o.subParts) {
+      const partPts = part.local.map((p) => ({
+        x: body.position.x + p.x * c - p.y * s,
+        y: body.position.y + p.x * s + p.y * c
+      }));
+      const scaledPart = popScaled(o, partPts);
+      if (scaledPart.length < 2) continue;
+      buildPath(scaledPart);
+      if (part.kind === "solid" || scaledPart.length > 2) {
+        ctx.closePath();
+        ctx.fillStyle = "hsla(" + (part.hue || o.hue) + ", 100%, 60%, 0.24)";
+        ctx.fill();
+      }
+      neonStroke(held ? "#ffffff" : "hsl(" + (part.hue || o.hue) + ", 100%, 60%)", core, wide);
+    }
+    drawObjectLabel(o, popScaled(o, getWorldPointsSafe(o)));
+    return;
+  }
+
+  if (o.kind === "solid") {
+    pts = popScaled(o, getWorldPointsSafe(o));
+    if (pts.length < 3) return;
+    buildPath(pts);
+    ctx.closePath();
+    ctx.save();
+    ctx.globalAlpha *= 0.22;
+    ctx.fillStyle = o.color || "hsl(" + o.hue + ", 100%, 60%)";
+    ctx.fill();
+    ctx.restore();
+    neonStroke(glow, core, wide);
+  } else {
+    const rawPts = o.kind === "platform" ? o.raw : getWorldPointsSafe(o);
+    pts = popScaled(o, rawPts);
+    if (!pts || pts.length < 2) return;
+    buildPath(pts);
+    neonStroke(glow, core, wide);
+
+    // Subtle pulsing pull-ring around Spiral Gravity Wells
+    if (o.kind === "spiral" && o.body) {
+      const pulseR = (o.wellRadius || 38) * (1.1 + 0.25 * Math.sin(performance.now() / 240));
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(o.body.position.x, o.body.position.y, pulseR, 0, Math.PI * 2);
+      ctx.setLineDash([5, 7]);
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = o.color || "#c56bff";
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+  drawObjectLabel(o, pts);
+}
+
+// Dashed green outline around selected objects.
+function drawSelection(o) {
+  if (o.isMerged && o.subParts && o.body) {
+    const body = o.body;
+    const c = Math.cos(body.angle), s = Math.sin(body.angle);
+    ctx.save();
+    ctx.setLineDash([12, 9]);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#7dffb0";
+    for (const part of o.subParts) {
+      const pts = part.local.map((p) => ({
+        x: body.position.x + p.x * c - p.y * s,
+        y: body.position.y + p.x * s + p.y * c
+      }));
+      if (pts.length < 2) continue;
+      buildPath(pts);
+      if (part.kind === "solid" || pts.length > 2) ctx.closePath();
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
+  const pts = o.kind === "platform" ? o.raw : getWorldPointsSafe(o);
+  if (!pts || pts.length < 2) return;
+  buildPath(pts);
+  if (o.kind === "solid") ctx.closePath();
+  ctx.setLineDash([12, 9]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#7dffb0";
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawHitbox(b) {
+  if (!b || !b.parts) return;
+  const start = b.parts.length > 1 ? 1 : 0;
+  for (let k = start; k < b.parts.length; k++) {
+    const v = b.parts[k].vertices;
+    if (!v || v.length === 0) continue;
+    ctx.beginPath();
+    ctx.moveTo(v[0].x, v[0].y);
+    for (let i = 1; i < v.length; i++) {
+      ctx.lineTo(v[i].x, v[i].y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
+}
+
+function drawShockwaves() {
+  if (typeof shockwaves === "undefined" || shockwaves.length === 0) return;
+  ctx.save();
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const wave = shockwaves[i];
+    wave.r += wave.speed;
+    wave.alpha = Math.max(0, 1 - wave.r / wave.maxR);
+    if (wave.alpha <= 0) {
+      shockwaves.splice(i, 1);
+      continue;
+    }
+    ctx.beginPath();
+    ctx.arc(wave.x, wave.y, wave.r, 0, Math.PI * 2);
+    ctx.lineWidth = Math.max(2, 8 * wave.alpha);
+    ctx.strokeStyle = "hsla(" + wave.hue + ", 100%, 75%, " + wave.alpha + ")";
+    ctx.shadowColor = "hsl(" + wave.hue + ", 100%, 70%)";
+    ctx.shadowBlur = 20;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawInteractionVisuals(nowMs) {
+  if (scaleSession && scaleSession.target && pen && h2.pen) {
+    const first = penVis || pen;
+    const second = h2.vis || h2.pen;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    ctx.lineTo(second.x, second.y);
+    ctx.setLineDash([6, 6]);
+    ctx.lineDashOffset = -(nowMs / 20) % 12;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#38e8ff";
+    ctx.shadowColor = "#38e8ff";
+    ctx.shadowBlur = 12;
+    ctx.stroke();
+    ctx.restore();
+    drawChip("Scale: " + Math.round((scaleSession.target.scaleMultiplier || 1) * 100) + "%",
+      Math.round((first.x + second.x) / 2), Math.round((first.y + second.y) / 2 - 24), "#38e8ff", 1);
+  }
+
+  if (mergeCandidate && mergeProgress > 0) {
+    const bodyA = mergeCandidate.objA.body || mergeCandidate.objA.bodies[0];
+    const bodyB = mergeCandidate.objB.body || mergeCandidate.objB.bodies[0];
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(bodyA.position.x, bodyA.position.y);
+    ctx.lineTo(bodyB.position.x, bodyB.position.y);
+    ctx.lineWidth = 3 + mergeProgress * 4;
+    ctx.strokeStyle = "rgba(215, 120, 255, " + (0.4 + mergeProgress * 0.6) + ")";
+    ctx.shadowColor = "#e077ff";
+    ctx.shadowBlur = 14;
+    ctx.stroke();
+    ctx.restore();
+    drawChip("Merging", Math.round(mergeCandidate.midX), Math.round(mergeCandidate.midY - 28), "#e077ff", mergeProgress);
+  }
+
+  if (demergeCandidate && demergeProgress > 0.08 && pen && h2.pen) {
+    const first = penVis || pen;
+    const second = h2.vis || h2.pen;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    ctx.lineTo(second.x, second.y);
+    ctx.setLineDash([7, 5]);
+    ctx.lineWidth = 3 + demergeProgress * 5;
+    ctx.strokeStyle = demergeProgress > 0.65 ? "#ff4757" : "#ffa502";
+    ctx.stroke();
+    ctx.restore();
+    drawChip("Splitting", Math.round((first.x + second.x) / 2), Math.round((first.y + second.y) / 2 - 28), "#ffa502", demergeProgress);
+  }
+}
+
+// A small rounded label, in the same style as the button tooltips.
+// fillFrac (0 to 1) fills the label from the left like a progress bar.
+function drawChip(text, cx, y, accent, fillFrac) {
+  ctx.save();
+  ctx.font = "bold 12px Arial";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  const padX = 12;
+  const h = 24;
+  const w = Math.round(ctx.measureText(text).width + padX * 2);
+  const x = Math.round(cx - w / 2);
+
+  roundRectPath(x, y, w, h, h / 2);
+  ctx.fillStyle = "rgba(10,12,18,0.82)";
+  ctx.fill();
+
+  if (fillFrac !== undefined && fillFrac > 0) {
+    ctx.save();
+    roundRectPath(x, y, w, h, h / 2);
+    ctx.clip();
+    ctx.globalAlpha = 0.45;
+    ctx.fillStyle = accent;
+    ctx.fillRect(x, y, w * fillFrac, h);
+    ctx.restore();
+  }
+
+  roundRectPath(x, y, w, h, h / 2);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = accent;
+  ctx.stroke();
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, x + padX, y + h / 2 + 1);
+  ctx.restore();
+}
+
+function drawPoseUI(nowMs) {
+  const cx = Math.round(canvas.width / 2);
+  if (pausedWorld) {
+    drawChip("Paused", cx, 12, "#ffb347");
+  }
+  if (toast && nowMs < toast.until) {
+    drawChip(toast.text, cx, 44, "#7dffb0");
+  } else if (swipeProgress > 0.15) {
+    drawChip("Swipe", cx, 44, "#38e8ff", swipeProgress);
+  } else if (candPose && !candFired && typeof POSE_HOLD_MS !== "undefined") {
+    const f = Math.min(1, (nowMs - candStartMs) / POSE_HOLD_MS[candPose]);
+    const label = typeof poseLabel === "function" ? poseLabel(candPose) : candPose;
+    drawChip(label, cx, 44, "#38e8ff", f);
+  } else if (typeof h2 !== "undefined" && h2.candPose && !h2.candFired) {
+    const hold = POSE_HOLD_MS[h2.candPose] || 500;
+    const f = Math.min(1, (nowMs - h2.candStartMs) / hold);
+    const label = typeof poseLabel === "function" ? poseLabel(h2.candPose) : h2.candPose;
+    drawChip(label, cx, 44, "#5dff9a", f);
+  }
+}
+
+function render() {
+  const nowR = performance.now();
+
+  // Ease the on-screen pen toward the tracked pen so the cursor and trail move smoothly at full frame rate.
+  if (pen) {
+    if (!penVis) {
+      penVis = { x: pen.x, y: pen.y };
+    } else {
+      const f = 1 - Math.exp(-(nowR - lastRenderMs) / 16);
+      penVis.x += (pen.x - penVis.x) * f;
+      penVis.y += (pen.y - penVis.y) * f;
+    }
+  } else {
+    penVis = null;
+  }
+  if (typeof h2 !== "undefined" && h2.pen) {
+    if (!h2.vis) h2.vis = { x: h2.pen.x, y: h2.pen.y };
+    else {
+      const f = 1 - Math.exp(-(nowR - lastRenderMs) / 16);
+      h2.vis.x += (h2.pen.x - h2.vis.x) * f;
+      h2.vis.y += (h2.pen.y - h2.vis.y) * f;
+    }
+  } else if (typeof h2 !== "undefined") {
+    h2.vis = null;
+  }
+  lastRenderMs = nowR;
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+
+  // finished physics objects
+  if (typeof objects !== "undefined") {
+    for (const o of objects) {
+      drawObject(o);
+    }
+  }
+
+  // links between objects
+  if (typeof links !== "undefined" && links.length > 0) {
+    ctx.save();
+    ctx.setLineDash([8, 6]);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#ffd36b";
+    for (const k of links) {
+      if (!k || !k.c || !k.c.bodyA || !k.c.bodyB) continue;
+      const A = k.c.bodyA.position;
+      const B = k.c.bodyB.position;
+      ctx.beginPath();
+      ctx.moveTo(A.x, A.y);
+      ctx.lineTo(B.x, B.y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // selection outlines
+  if (typeof selected !== "undefined" && typeof objects !== "undefined") {
+    for (const o of Array.from(selected)) {
+      if (!objects.includes(o)) {
+        selected.delete(o);
+        continue;
+      }
+      drawSelection(o);
+    }
+  }
+
+  // grab highlight: a glowing outline on whatever each hand is holding
+  const pulse = 0.65 + 0.35 * Math.sin(performance.now() / 160);
+  const glow = (o, color) => {
+    if (!o || typeof objects === "undefined" || !objects.includes(o)) return;
+    const pts = o.kind === "platform" ? o.raw : getWorldPointsSafe(o);
+    if (!pts || pts.length < 2) return;
+    ctx.save();
+    buildPath(pts);
+    if (o.kind === "solid") ctx.closePath();
+    ctx.globalAlpha = pulse;
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = color;
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 18;
+    ctx.stroke();
+    ctx.restore();
+  };
+  try {
+    if (grabbed) glow(grabbed.obj, "#38e8ff");
+    if (typeof h2 !== "undefined" && h2.grab) glow(h2.grab.obj, "#5dff9a");
+  } catch (err) {
+    ctx.restore();
+    console.error("glow error:", err);
+  }
+
+  if (typeof h2 !== "undefined" && h2.pen) {
+    ctx.beginPath();
+    ctx.arc(h2.pen.x, h2.pen.y, h2.pinch ? 10 : 14, 0, 6.283);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = h2.grab ? "#5dff9a" : (h2.pinch ? "#ffb347" : "#ffffff");
+    ctx.stroke();
+    if (h2.grabCandidate) {
+      const progress = Math.min(1, (nowR - h2.grabCandidate.startMs) / GRAB_HOLD_MS);
+      ctx.beginPath();
+      ctx.arc(h2.pen.x, h2.pen.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
+      ctx.strokeStyle = "#ffb020";
+      ctx.lineWidth = 5;
+      ctx.stroke();
+    }
+  }
+
+  // sparks
+  if (typeof particles !== "undefined" && particles.length > 0) {
+    for (const p of particles) {
+      ctx.globalAlpha = Math.max(0, 1 - p.life / p.max);
+      if (p.hue !== undefined) {
+        ctx.strokeStyle = p.color || "hsl(" + p.hue + ", 100%, 70%)";
+        ctx.lineWidth = 3;
+      } else {
+        ctx.strokeStyle = "#bff6ff";
+        ctx.lineWidth = 2;
+      }
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - p.vx * 1.8, p.y - p.vy * 1.8);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  drawShockwaves();
+  drawInteractionVisuals(nowR);
+
+  // strokes being drawn right now (hand and mouse), smoothed for display + live dotted preview
+  if (current && typeof smoothStroke === "function") {
+    const rawWithTip = current.slice();
+    if (pinching && penVis && rawWithTip.length > 0 && dist(rawWithTip[rawWithTip.length - 1], penVis) > 0.5) {
+      rawWithTip.push({ x: penVis.x, y: penVis.y });
+    }
+    const live = window.smoothCurve(smoothStroke(rawWithTip, 2));
+    if (live.length >= 2) {
+      buildPath(live);
+      neonStroke(drawingColor, drawingColor, 4.5);
+      drawLiveShapePreview(rawWithTip);
+    }
+  }
+  if (typeof h2 !== "undefined" && h2.current && typeof smoothStroke === "function") {
+    const rawWithTip2 = h2.current.slice();
+    const pen2 = h2.vis || h2.pen;
+    if (h2.pinching && pen2 && rawWithTip2.length > 0 && dist(rawWithTip2[rawWithTip2.length - 1], pen2) > 0.5) {
+      rawWithTip2.push({ x: pen2.x, y: pen2.y });
+    }
+    const live2 = window.smoothCurve(smoothStroke(rawWithTip2, 2));
+    if (live2.length >= 2) {
+      buildPath(live2);
+      neonStroke("#5dff9a", "#caffd8", 4.5);
+      drawLiveShapePreview(rawWithTip2);
+    }
+  }
+  if (mouseCurrent && mouseCurrent.length >= 2 && typeof smoothStroke === "function") {
+    buildPath(window.smoothCurve(smoothStroke(mouseCurrent, 2)));
+    neonStroke(drawingColor, drawingColor, 4.5);
+    drawLiveShapePreview(mouseCurrent);
+  }
+
+  // hitboxes (debug): shows the real physics shapes
+  if (showHitboxes && typeof objects !== "undefined") {
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(255,255,255,0.9)";
+    for (const o of objects) {
+      for (const b of o.bodies) {
+        drawHitbox(b);
+      }
+    }
+    if (typeof walls !== "undefined") {
+      ctx.strokeStyle = "rgba(255,200,0,0.7)";
+      for (const w of walls) {
+        drawHitbox(w);
+      }
+    }
+  }
+
+  // thin dotted line from your real fingers to the stretched pen ring
+  if (showSkeleton && realPen && penVis && typeof REACH_LEVELS !== "undefined" && REACH_LEVELS[reachIdx] !== 1) {
+    ctx.setLineDash([4, 6]);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(realPen.x, realPen.y);
+    ctx.lineTo(penVis.x, penVis.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // hand skeleton (debug)
+  if (showSkeleton && skeletonPts && typeof HAND_CONNECTIONS !== "undefined") {
+    const pts = skeletonPts;
+    ctx.strokeStyle = "rgba(120,255,160,0.8)";
+    ctx.lineWidth = 2;
+    for (const [a, b] of HAND_CONNECTIONS) {
+      if (!pts[a] || !pts[b]) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts[a].x, pts[a].y);
+      ctx.lineTo(pts[b].x, pts[b].y);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    for (const p of pts) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  if (showSkeleton && typeof h2 !== "undefined" && h2.skeletonPts && typeof HAND_CONNECTIONS !== "undefined") {
+    const pts2 = h2.skeletonPts;
+    ctx.strokeStyle = "rgba(80,220,255,0.8)";
+    ctx.lineWidth = 2;
+    for (const [a, b] of HAND_CONNECTIONS) {
+      if (!pts2[a] || !pts2[b]) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts2[a].x, pts2[a].y);
+      ctx.lineTo(pts2[b].x, pts2[b].y);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    for (const p of pts2) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // gesture bar buttons
+  drawGestureBar(performance.now());
+  drawTab(performance.now());
+  drawPoseUI(nowR);
+
+  // pen cursor (turns amber while holding an object)
+  const pv = penVis || pen;
+  if (pv) {
+    ctx.beginPath();
+    ctx.arc(pv.x, pv.y, grabbed ? 14 : (pinching ? 10 : 7), 0, Math.PI * 2);
+    ctx.strokeStyle = grabbed ? "#ffb020" : (pinching ? "#38e8ff" : "#ffffff");
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    if (grabCandidate) {
+      const f = Math.min(1, (nowR - grabCandidate.startMs) / GRAB_HOLD_MS);
+      ctx.beginPath();
+      ctx.arc(pv.x, pv.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * f);
+      ctx.strokeStyle = "#ffb020";
+      ctx.lineWidth = 5;
+      ctx.stroke();
+    }
+    if (hoverObj) {
+      const f = Math.min(1, (nowR - hoverStartMs) / SELECT_HOLD_MS);
+      ctx.beginPath();
+      ctx.arc(pv.x, pv.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * f);
+      ctx.strokeStyle = "#7dffb0";
+      ctx.lineWidth = 5;
+      ctx.stroke();
+    }
+  }
+}
+
+function updateStatus() {
+  const nowS = performance.now();
+  if (nowS - lastStatusMs < 200) return;
+  lastStatusMs = nowS;
+  const handCount = (handVisible ? 1 : 0) + ((typeof h2 !== "undefined" && h2.visible) ? 1 : 0);
+  const handText = handCount === 2 ? "2 Hands tracked" : (handCount === 1 ? "1 Hand tracked" : "No hand");
+  const actions = [];
+  if (grabbed && grabbed.obj) actions.push("H1 holding " + (grabbed.obj.shapeType || "object"));
+  else if (pinching) actions.push("H1 drawing");
+  if (typeof h2 !== "undefined" && h2.grab && h2.grab.obj) actions.push("H2 holding " + (h2.grab.obj.shapeType || "object"));
+  else if (typeof h2 !== "undefined" && h2.pinching) actions.push("H2 drawing");
+  const mode = actions.length ? actions.join(" & ") : (tabHold || h1ToolbarTouch || h2ToolbarTouch ? "Button panel" : "Ready");
+  if (pausedWorld) mode += " (paused)";
+  const objCount = typeof objects !== "undefined" ? objects.length : 0;
+  if (statusEl) {
+    statusEl.textContent =
+      handText +
+      "   |   " + mode +
+      "   |   " + objCount + " objects" +
+      "   |   " + fps + " fps" +
+      "   |   Last: " + lastInfo;
+    // full details appear when the mouse rests on the status line
+    const isConcave = typeof concaveSupport !== "undefined" ? concaveSupport : !!window.decomp;
+    statusEl.title =
+      "Tracking " + trackMs.toFixed(1) + " ms per frame" +
+      "  |  Pinch ratio " + lastRatio.toFixed(2) +
+      "  |  Pose " + (candPose || "none") +
+      "  |  Gravity " + (gravityOn ? "on" : "off") +
+      "  |  Reach " + REACH_LEVELS[reachIdx] + "x" +
+      "  |  Concave shapes: " + (isConcave ? "supported" : "NOT loaded (using hulls)") +
+      "  |  Deleted false strokes: " + cancelled +
+      "  |  Last stroke: " + lastInfo;
+  }
+}
+
+// ------------------------------------------------------------
+// Buttons
+// ------------------------------------------------------------
+// The same actions are used by the page buttons, the mouse, and the hand.
+function clearAll() {
+  if (typeof clearObjects === "function") clearObjects();
+  if (typeof clearMoves === "function") clearMoves();
+  current = null;
+  if (typeof h2 !== "undefined") {
+    h2.current = null;
+    h2.grabCandidate = null;
+    h2.pending = [];
+    h2.pinching = false;
+    h2.pinch = false;
+  }
+  h1ToolbarTouch = null;
+  h2ToolbarTouch = null;
+  mouseToolbarTouch = null;
+  mouseCurrent = null;
+  pinching = false;
+  cancelled = 0;
+  lastInfo = "none yet";
+  if (typeof showToast === "function") showToast("Cleared your shapes");
+}
+
+function toggleGravity() {
+  setGravityEnabled(!gravityOn);
+}
+
+function setGravityEnabled(enabled, broadcast = true) {
+  gravityOn = enabled;
+  if (typeof engine !== "undefined" && engine.gravity) {
+    engine.gravity.y = gravityOn ? 1 : 0;
+  }
+  syncButtons();
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
+}
+
+function setPausedWorld(paused, broadcast = true) {
+  pausedWorld = paused;
+  syncButtons();
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
+}
+
+function toggleLines() {
+  setLinesFall(!linesFall);
+}
+
+function setLinesFall(enabled, broadcast = true) {
+  linesFall = enabled;
+  syncButtons();
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
+}
+
+function setPushFrozen(enabled, broadcast = true) {
+  pushFrozen = enabled;
+  const button = document.getElementById("pushFrozenBtn");
+  if (button) button.textContent = "Push frozen: " + (pushFrozen ? "on" : "off");
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
+}
+
+function toggleHitboxes() {
+  showHitboxes = !showHitboxes;
+  syncButtons();
+}
+
+function toggleSkeleton() {
+  showSkeleton = !showSkeleton;
+  syncButtons();
+}
+
+function toggleBar() {
+  showBar = !showBar;
+  dwellTarget = null;
+  syncButtons();
+}
+
+// Updates the icon buttons under the video: highlight, count badge, and the hover tooltip text.
+function setBtn(btn, tip, on, badge) {
+  if (!btn) return;
+  btn.setAttribute("data-tip", tip);
+  btn.setAttribute("aria-label", tip.split("\n")[0]);
+  btn.classList.toggle("on", !!on);
+  const bd = btn.querySelector(".badge");
+  if (bd) {
+    bd.textContent = badge ? String(badge) : "";
+    bd.style.display = badge ? "block" : "none";
+  }
+}
+
+function syncButtons() {
+  const selSet = typeof selected !== "undefined" ? selected : new Set();
+  const n = selSet.size;
+  setBtn(
+    gravityBtn,
+    "Gravity: " + (gravityOn ? "ON" : "OFF") + "\n" + (gravityOn ? "Drawings fall. Click to turn off." : "Drawings float. Click to turn on."),
+    gravityOn
   );
-  const options = (delegate) => ({
-    baseOptions: {
-      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate: delegate
-    },
-    runningMode: "VIDEO",
-    numHands: 2,
-    minHandDetectionConfidence: 0.35,
-    minHandPresenceConfidence: 0.35,
-    minTrackingConfidence: 0.35
+  setBtn(
+    linesBtn,
+    "Open lines: " + (linesFall ? "FALL" : "FIXED") + "\n" + (linesFall ? "Open lines, cups, and springs drop like objects. Click to make them fixed." : "Open lines, cups, and springs stay fixed in the air. Click to let them fall."),
+    linesFall
+  );
+  setBtn(
+    reverseBtn,
+    n > 0
+      ? "Reverse selected (" + n + ")\nSends them back to where you drew them and freezes them until deselected."
+      : "Reverse last moved\nSends the last object you moved back to where you drew it.",
+    false,
+    n
+  );
+  setBtn(deselectBtn, "Deselect all\nUnselects everything. Frozen objects fall again.", false, n);
+  setBtn(
+    floatBtn,
+    "Float selected\nSelected objects drift up. Press again to let them fall. Thumbs up and thumbs down do the same.",
+    Array.from(selSet).some((o) => o && o.floating),
+    n
+  );
+  setBtn(cloneBtn, "Clone selected\nMakes a copy of each selected object.", false, n);
+  setBtn(destroyBtn, "Destroy selected\nShatters the selected objects.", false, n);
+  setBtn(clearBtn, "Clear your shapes\nDeletes every shape you created.", false);
+  setBtn(
+    hitboxBtn,
+    "Hitboxes: " + (showHitboxes ? "ON" : "OFF") + "\nShows the real physics shapes, to check collisions.",
+    showHitboxes
+  );
+  setBtn(
+    skeletonBtn,
+    "Hand skeleton: " + (showSkeleton ? "ON" : "OFF") + "\nShows the green hand tracking lines.",
+    showSkeleton
+  );
+  setBtn(
+    barBtn,
+    "Button panel: " + (showBar ? "OPEN" : "HIDDEN") + "\nThe icon panel on the video. You can also open it with the arrow tab.",
+    showBar
+  );
+  setBtn(
+    dockBtn,
+    "Panel side: " + (dockRight ? "RIGHT" : "LEFT") + "\nMoves the button panel to the " + (dockRight ? "left" : "right") + " edge.",
+    false
+  );
+  setBtn(
+    reachBtn,
+    "Reach: " + REACH_LEVELS[reachIdx] + "x\nHow far your hand movement is stretched. Click to change.",
+    false,
+    REACH_LEVELS[reachIdx] + "x"
+  );
+  setBtn(
+    helpBtn,
+    "How to use\nShow or hide the short instructions.",
+    helpPanel && helpPanel.classList.contains("open")
+  );
+}
+
+if (clearBtn) clearBtn.addEventListener("click", () => clearAll());
+if (gravityBtn) gravityBtn.addEventListener("click", () => toggleGravity());
+if (linesBtn) linesBtn.addEventListener("click", () => toggleLines());
+if (hitboxBtn) hitboxBtn.addEventListener("click", () => toggleHitboxes());
+if (skeletonBtn) skeletonBtn.addEventListener("click", () => toggleSkeleton());
+if (barBtn) barBtn.addEventListener("click", () => toggleBar());
+if (reverseBtn) {
+  reverseBtn.addEventListener("click", () => {
+    if (typeof reverseMove === "function") reverseMove();
   });
-  try {
-    landmarker = await HandLandmarker.createFromOptions(fileset, options("GPU"));
-  } catch (err) {
-    landmarker = await HandLandmarker.createFromOptions(fileset, options("CPU"));
-  }
+}
+if (deselectBtn) {
+  deselectBtn.addEventListener("click", () => {
+    if (typeof clearSelection === "function") clearSelection();
+  });
+}
+if (floatBtn) {
+  floatBtn.addEventListener("click", () => {
+    if (typeof floatSelected === "function") floatSelected("toggle");
+  });
+}
+if (cloneBtn) {
+  cloneBtn.addEventListener("click", () => {
+    if (typeof cloneSelected === "function") cloneSelected();
+  });
+}
+if (destroyBtn) {
+  destroyBtn.addEventListener("click", () => {
+    if (typeof destroySelected === "function") destroySelected();
+  });
+}
+if (dockBtn) dockBtn.addEventListener("click", () => toggleDock());
+if (helpBtn) {
+  helpBtn.addEventListener("click", () => {
+    if (helpPanel) helpPanel.classList.toggle("open");
+    syncButtons();
+  });
+}
+if (reachBtn) {
+  reachBtn.addEventListener("click", () => {
+    reachIdx = (reachIdx + 1) % REACH_LEVELS.length;
+    syncButtons();
+  });
 }
 
 // ------------------------------------------------------------
-// Pose gestures: open palm, fist, peace, thumbs, shaka, and sideways swipe
+// Gesture dock: a slim panel on the screen edge. Hold the pen ring over a
+// button to press it (dwell selection). The press zone reaches the screen edge.
 // ------------------------------------------------------------
-
-// True while the hand is closing into a fist: the three fingers beside the index are curled
-// and the index tip is already tucked close to the wrist. A thumb-index pinch happens
-// on the way to a fist, so this stops it from drawing.
-function handClosing(pts) {
-  const wrist = pts[0];
-  const size = dist(pts[0], pts[9]);
-  if (size <= 0) return false;
-  const ext = (tip, pip) => dist(pts[tip], wrist) > dist(pts[pip], wrist) * 1.08;
-  const othersOut = ext(12, 10) || ext(16, 14) || ext(20, 18);
-  return !othersOut && dist(pts[8], wrist) < size * FIST_BLOCK_INDEX_MAX;
-}
-
-// The label shows what the pose will do right now.
-function poseLabel(pose) {
-  const sel = selected.size > 0;
-  if (pose === "OPEN PALM") return sel ? "Deselect all" : (pausedWorld ? "Resume" : "Pause");
-  if (pose === "FIST") return sel ? "Destroy (keep holding)" : "Fist";
-  if (pose === "PEACE") return "Clone";
-  if (pose === "THUMBS UP") return sel ? "Float" : "Gravity off";
-  if (pose === "THUMBS DOWN") return sel ? "Fall" : "Gravity on";
-  if (pose === "SHAKA UP") return "Select all (" + objects.length + ")";
-  if (pose === "SHAKA DOWN") return "Deselect all";
-  return pose;
-}
-
-function showToast(text) {
-  toast = { text: text, until: performance.now() + 1400 };
-}
-
-// Looks at the 21 hand points (real hand position) and names the pose, or returns null.
-function classifyPose(pts) {
-  const wrist = pts[0];
-  const handSize = dist(pts[0], pts[9]);
-  if (handSize <= 0) return null;
-
-  // A finger counts as extended when its tip is farther from the wrist than its middle joint.
-  const ext = (tip, pip) => dist(pts[tip], wrist) > dist(pts[pip], wrist) * 1.08;
-  const indexE = ext(8, 6);
-  const middleE = ext(12, 10);
-  const ringE = ext(16, 14);
-  const pinkyE = ext(20, 18);
-  const thumbE =
-    dist(pts[4], pts[17]) > dist(pts[3], pts[17]) * 1.05 &&
-    dist(pts[4], pts[5]) > handSize * 0.45;
-  const count = [indexE, middleE, ringE, pinkyE].filter(Boolean).length;
-
-  if (count === 4 && thumbE) return "OPEN PALM";
-
-  // Shaka gesture: thumb and pinky extended, while index, middle, and ring are curled.
-  // Normal orientation (thumb above pinky) selects all; inverted (pinky above thumb) deselects all.
-  if (thumbE && pinkyE && !indexE && !middleE && !ringE && dist(pts[4], pts[20]) > handSize * 0.85) {
-    if (pts[4].y <= pts[20].y + 0.1 * handSize) {
-      return "SHAKA UP";
+var gButtons = [
+  {
+    icon: "gravity",
+    isOn: () => gravityOn,
+    action: () => toggleGravity(),
+    dwell: DWELL_MS,
+    tip: () => [
+      "Gravity: " + (gravityOn ? "ON" : "OFF"),
+      gravityOn ? "Drawings fall. Hold to turn off." : "Drawings float. Hold to turn on."
+    ]
+  },
+  {
+    icon: "lines",
+    isOn: () => linesFall,
+    action: () => toggleLines(),
+    dwell: DWELL_MS,
+    tip: () => [
+      "Open lines: " + (linesFall ? "FALL" : "FIXED"),
+      "Falling lines drop like objects. Fixed lines stay as ramps."
+    ]
+  },
+  {
+    icon: "reverse",
+    isOn: null,
+    action: () => { if (typeof reverseMove === "function") reverseMove(); },
+    dwell: DWELL_MS,
+    badge: () => (typeof selected !== "undefined" ? selected.size : 0),
+    tip: () => {
+      const sz = typeof selected !== "undefined" ? selected.size : 0;
+      return [
+        sz > 0 ? "Reverse " + sz + " selected" : "Reverse last moved",
+        "Sends them back to where you drew them and freezes them until deselected."
+      ];
     }
-    return "SHAKA DOWN";
+  },
+  {
+    icon: "deselect",
+    isOn: null,
+    action: () => { if (typeof clearSelection === "function") clearSelection(); },
+    dwell: DWELL_MS,
+    badge: () => (typeof selected !== "undefined" ? selected.size : 0),
+    tip: () => ["Deselect all", "Unselects everything. Frozen objects fall again."]
+  },
+  {
+    icon: "float",
+    isOn: () => (typeof selected !== "undefined" ? Array.from(selected).some((o) => o && o.floating) : false),
+    action: () => { if (typeof floatSelected === "function") floatSelected("toggle"); },
+    dwell: DWELL_MS,
+    badge: () => (typeof selected !== "undefined" ? selected.size : 0),
+    tip: () => ["Float selected", "Selected objects drift up. Hold again to let them fall."]
+  },
+  {
+    icon: "clone",
+    isOn: null,
+    action: () => { if (typeof cloneSelected === "function") cloneSelected(); },
+    dwell: DWELL_MS,
+    badge: () => (typeof selected !== "undefined" ? selected.size : 0),
+    tip: () => ["Clone selected", "Makes a copy of each selected object."]
+  },
+  {
+    icon: "destroy",
+    isOn: null,
+    action: () => { if (typeof destroySelected === "function") destroySelected(); },
+    dwell: DWELL_DANGER_MS,
+    danger: true,
+    badge: () => (typeof selected !== "undefined" ? selected.size : 0),
+    tip: () => ["Destroy selected", "Shatters the selected objects. Keep holding to confirm."]
+  },
+  {
+    icon: "hitbox",
+    isOn: () => showHitboxes,
+    action: () => toggleHitboxes(),
+    dwell: DWELL_MS,
+    tip: () => ["Hitboxes: " + (showHitboxes ? "ON" : "OFF"), "Shows the real physics shapes."]
+  },
+  {
+    icon: "skeleton",
+    isOn: () => showSkeleton,
+    action: () => toggleSkeleton(),
+    dwell: DWELL_MS,
+    tip: () => ["Hand skeleton: " + (showSkeleton ? "ON" : "OFF"), "Shows the green hand tracking lines."]
+  },
+  {
+    icon: "clear",
+    isOn: null,
+    action: () => clearAll(),
+    dwell: DWELL_DANGER_MS,
+    danger: true,
+    tip: () => ["Clear your shapes", "Deletes every shape you created. Keep holding to confirm."]
   }
+];
 
-  // Peace sign: index and middle fingers up and apart, ring and pinky folded.
-  if (indexE && middleE && !ringE && !pinkyE && dist(pts[8], pts[12]) > handSize * 0.25) return "PEACE";
+var toolbarScrollY = 0;
+var toolbarTargetScrollY = 0;
+var toolbarMinScroll = 0;
+var toolbarMaxScroll = 0;
 
-  if (count === 0) {
-    if (thumbE) {
-      if (pts[4].y < pts[2].y - 0.4 * handSize) return "THUMBS UP";
-      if (pts[4].y > pts[2].y + 0.4 * handSize) return "THUMBS DOWN";
-      return null;
-    }
-    // A fist has the index tip tucked in close to the wrist. A pinch does not.
-    if (dist(pts[8], wrist) < handSize * FIST_INDEX_MAX) return "FIST";
+function toolbarPanelRect() {
+  const width = canvas.width || 1280;
+  const height = canvas.height || 720;
+  const scale = Math.max(0.85, Math.min(1.15, width / 1100));
+  const size = Math.round(48 * scale);
+  const gap = Math.round(7 * scale);
+  const margin = Math.round(9 * scale);
+  const panelH = Math.min(height - 70, 6 * size + 5 * gap + margin * 2);
+  const panelW = size + margin * 2;
+  const x = dockRight ? width - panelW - 6 : 6;
+  return { x: x, y: Math.round((height - panelH) / 2), w: panelW, h: panelH, size: size, gap: gap, margin: margin };
+}
+
+function toolbarPanelAt(point) {
+  if (!point || !showBar) return false;
+  const rect = toolbarPanelRect();
+  return point.x >= rect.x - 8 && point.x <= rect.x + rect.w + 8 &&
+    point.y >= rect.y - 6 && point.y <= rect.y + rect.h + 6;
+}
+
+function setToolbarScroll(value) {
+  toolbarTargetScrollY = Math.max(toolbarMinScroll, Math.min(toolbarMaxScroll, value));
+}
+
+function toggleDock() {
+  dockRight = !dockRight;
+  dwellTarget = null;
+  toolbarScrollY = 0;
+  toolbarTargetScrollY = 0;
+  layoutButtons();
+  syncButtons();
+}
+
+function layoutButtons() {
+  const rect = toolbarPanelRect();
+  const total = gButtons.length * rect.size + (gButtons.length - 1) * rect.gap;
+  const innerH = rect.h - rect.margin * 2;
+  toolbarMinScroll = Math.min(0, innerH - total);
+  toolbarMaxScroll = 0;
+  toolbarScrollY += (toolbarTargetScrollY - toolbarScrollY) * 0.32;
+  let y = rect.y + rect.margin + toolbarScrollY;
+  for (const b of gButtons) {
+    b.x = rect.x + rect.margin;
+    b.y = y;
+    b.w = rect.size;
+    b.h = rect.size;
+    y += rect.size + rect.gap;
+  }
+}
+
+function buttonAt(p) {
+  if (!p || !showBar || !toolbarPanelAt(p)) return null;
+  const rect = toolbarPanelRect();
+  for (const b of gButtons) {
+    if (b.x === undefined || b.y === undefined) continue;
+    const visible = b.y + b.h >= rect.y + rect.margin && b.y <= rect.y + rect.h - rect.margin;
+    if (visible && p.x >= b.x - 8 && p.x <= b.x + b.w + 8 &&
+        p.y >= b.y - 4 && p.y <= b.y + b.h + 4) return b;
   }
   return null;
 }
 
-// How many of the four fingers (not the thumb) are stretched out. Used to accept a blurry open hand during a swipe.
-function extendedCount(pts) {
-  const wrist = pts[0];
-  const ext = (tip, pip) => dist(pts[tip], wrist) > dist(pts[pip], wrist) * 1.08;
-  return [ext(8, 6), ext(12, 10), ext(16, 14), ext(20, 18)].filter(Boolean).length;
-}
-
-// The middle of the palm: steadier than the wrist when the hand moves fast.
-function palmCenter(pts) {
-  let x = 0;
-  let y = 0;
-  for (const i of [0, 5, 9, 13, 17]) {
-    x += pts[i].x;
-    y += pts[i].y;
+function pressButton(b, nowMs) {
+  if (b && typeof b.action === "function") {
+    b.action();
   }
-  return { x: x / 5, y: y / 5 };
+  flashButton = b;
+  flashUntil = nowMs + 350;
 }
 
-function selectAllObjects() {
-  if (objects.length === 0) {
-    showToast("No objects on screen");
+function updateDwell(nowMs) {
+  // No pressing while the dock is hidden, the hand is gone, or you are drawing (pinching).
+  const over = (showBar && pen && !pinching) ? buttonAt(pen) : null;
+  if (dwellLock && over !== dwellLock) dwellLock = null;
+  if (!over || over === dwellLock) {
+    dwellTarget = null;
     return;
   }
-  for (const o of objects) {
-    selected.add(o);
-  }
-  lastSelectMs = performance.now();
-  if (typeof playTone === "function") playTone(660, 0.08);
-  showToast("Selected all (" + selected.size + ")");
-  if (typeof syncButtons === "function") syncButtons();
-}
-
-function runAction(name, triggerPen) {
-  if (name === "pause") {
-    setPausedWorld(!pausedWorld);
-    showToast(pausedWorld ? "Paused" : "Resumed");
-  } else if (name === "selectAll") {
-    selectAllObjects();
-  } else if (name === "deselect") {
-    if (selected.size === 0) {
-      showToast("Nothing selected");
-      return;
-    }
-    clearSelection();
-    if (typeof playTone === "function") playTone(440, 0.07);
-    showToast("Deselected all");
-  } else if (name === "floatUp") {
-    if (selected.size > 0) {
-      floatSelected("on");
-    } else {
-      if (gravityOn) toggleGravity();
-      showToast("Gravity off");
-    }
-  } else if (name === "fallDown") {
-    if (selected.size > 0) {
-      floatSelected("off");
-    } else {
-      if (!gravityOn) toggleGravity();
-      showToast("Gravity on");
-    }
-  } else if (name === "palm") {
-    if (selected.size > 0) {
-      clearSelection();
-      showToast("Deselected all");
-    } else {
-      runAction("pause");
-    }
-  } else if (name === "destroyPose") {
-    if (selected.size > 0) destroySelected();   // a fist with nothing selected does nothing
-  } else if (name === "clone") {
-    cloneSelected();
-  } else if (name === "undo") {
-    // Phase 2 swipe-to-erase: if hovering over an object, erase that object; otherwise undo last drawing
-    const activePen = triggerPen || pen || h2.pen;
-    const hoveredTarget = activePen ? objectAtPoint(activePen) : null;
-    if (hoveredTarget) {
-      redoStack.push(serObj(hoveredTarget));
-      shatter(hoveredTarget);
-      removeObject(hoveredTarget);
-      if (typeof playTone === "function") playTone(200, 0.12);
-      showToast("Erased " + (hoveredTarget.shapeType || "object"));
-      if (typeof syncButtons === "function") syncButtons();
-      return;
-    }
-    const last = objects[objects.length - 1];
-    if (last) {
-      redoStack.push(serObj(last));
-      shatter(last);
-      removeObject(last);
-      showToast("Undid last drawing");
-    } else {
-      showToast("Nothing to undo");
-    }
-  }
-}
-
-// True while the ring is on something that has its own hold action (button, tab).
-function ringOnTarget() {
-  if (!pen) return false;
-  if (showBar && toolbarPanelAt(pen)) return true;
-  if (tabAt(pen)) return true;
-  return false;
-}
-
-function resetPose() {
-  candPose = null;
-  candFired = false;
-  wristHist = [];
-}
-
-function updatePose(nowMs) {
-  const real = skeletonPts;
-
-  // A short stroke followed by a fist is almost always the hand closing, not a drawing: remove it.
-  if (lastStrokeObj) {
-    if (nowMs - lastStrokeAt > ACCIDENT_WINDOW_MS || !objects.includes(lastStrokeObj)) {
-      lastStrokeObj = null;
-    } else if (real && lastStrokeObj.strokeLen < ACCIDENT_MAX_LEN && classifyPose(real) === "FIST") {
-      removeObject(lastStrokeObj);
-      lastStrokeObj = null;
-      cancelled++;
-      showToast("Stray stroke removed");
-    }
-  }
-
-  const busy = pinching || grabbed || grabCandidate || tabHold || h1ToolbarTouch || onCount > 0;
-  if (!real || busy || nowMs < poseBlockUntil) {
-    resetPose();
+  if (over !== dwellTarget) {
+    dwellTarget = over;
+    dwellStart = nowMs;
     return;
   }
-  const raw = classifyPose(real);
-
-  // Swipe: move an open hand sideways in one smooth sweep.
-  // Tolerant on purpose: a moving hand is blurry, so a mostly-open hand counts too.
-  swipeProgress = 0;
-  const openish = raw === "OPEN PALM" || (raw === null && extendedCount(real) >= 3);
-  if (openish) {
-    const c = palmCenter(real);
-    wristHist.push({ x: c.x, y: c.y, t: nowMs });
-    wristHist = wristHist.filter((p) => nowMs - p.t <= SWIPE_WINDOW_MS);
-    if (wristHist.length >= 3) {
-      let minX = Infinity;
-      let maxX = -Infinity;
-      let minY = Infinity;
-      let maxY = -Infinity;
-      for (const p of wristHist) {
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-      }
-      const dx = maxX - minX;
-      const dy = maxY - minY;
-      const net = Math.abs(wristHist[wristHist.length - 1].x - wristHist[0].x);
-      const need = Math.max(canvas.width * SWIPE_MIN_FRACTION, dist(real[0], real[9]) * SWIPE_MIN_HANDS);
-      if (dy < dx * 0.7 && net >= dx * 0.7) swipeProgress = Math.min(1, dx / need);
-      if (swipeProgress >= 1 && nowMs >= swipeCooldownUntil) {
-        runAction(SWIPE_ACTION, h2.pen);
-        swipeCooldownUntil = nowMs + SWIPE_COOLDOWN_MS;
-        poseBlockUntil = nowMs + POSE_POST_PINCH_MS;
-        swipeProgress = 0;
-        resetPose();
-        return;
-      }
-    }
-  } else {
-    wristHist = [];
-  }
-
-  // Hold poses: ignored while the ring sits on a button or the tab
-  let pose = ringOnTarget() ? null : raw;
-  if (pose === "OPEN PALM" && hoverObj) pose = null;   // selecting with an open hand must not trigger the palm action
-  // Just selected something: ignore the open palm for a moment, then it must be held steadily from scratch
-  if (pose === "OPEN PALM" && selected.size > 0 && nowMs - lastSelectMs < SELECT_SETTLE_MS) pose = null;
-  if (pose) lastPoseMs = nowMs;
-  if (!pose && candPose && nowMs - lastPoseMs < POSE_GRACE_MS) return;
-  const size = dist(real[0], real[9]);
-  if (pose && pose === candPose && candWrist && dist(real[0], candWrist) > size * POSE_MOVE_TOL) {
-    candStartMs = nowMs;            // the hand drifted: restart the hold
-    candWrist = { x: real[0].x, y: real[0].y };
-    candFired = false;
-  }
-  if (pose !== candPose) {
-    candPose = pose;
-    candStartMs = nowMs;
-    candFired = false;
-    candWrist = pose ? { x: real[0].x, y: real[0].y } : null;
-  }
-  const holdTarget = (candPose && POSE_HOLD_MS[candPose]) ? POSE_HOLD_MS[candPose] : 500;
-  if (candPose && !candFired && nowMs - candStartMs >= holdTarget) {
-    candFired = true;
-    runAction(GESTURE_ACTIONS[candPose]);
+  if (nowMs - dwellStart >= over.dwell) {
+    pressButton(over, nowMs);
+    dwellLock = over;
+    dwellTarget = null;
   }
 }
 
-function endPinch() {
-  if (h1ToolbarTouch) {
-    if (!h1ToolbarTouch.isScrolling) {
-      const button = h1ToolbarTouch.targetBtn || (pen ? buttonAt(pen) : null);
-      if (button) pressButton(button, performance.now());
-    }
-    h1ToolbarTouch = null;
-  }
-  if (grabbed) releaseGrab();
-  grabCandidate = null;
-  tabHold = null;
-  endStroke();
-  poseBlockUntil = performance.now() + POSE_POST_PINCH_MS;
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
 }
 
-function endStroke() {
-  if (current) {
-    const prevLast = objects[objects.length - 1];
-    const len = pathLength(current);
-    commitStroke(current);
-    const last = objects[objects.length - 1];
-    if (last && last !== prevLast) {
-      lastStrokeObj = last;
-      lastStrokeObj.strokeLen = len;
-      lastStrokeAt = performance.now();
-    }
-  }
-  current = null;
-  pinching = false;
-  onCount = 0;
-  offCount = 0;
-  pending = [];
+// Draws one of the ICONS on the video canvas.
+function drawIcon(name, cx, cy, size, color) {
+  if (typeof ICONS === "undefined") return;
+  const ic = ICONS[name];
+  if (!ic) return;
+  if (!ic.p2d) ic.p2d = new Path2D(ic.d);
+  ctx.save();
+  ctx.translate(cx - size / 2, cy - size / 2);
+  ctx.scale(size / 24, size / 24);
+  ctx.lineWidth = 2.2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = color;
+  ctx.setLineDash(ic.dash ? ic.dash.split(" ").map(Number) : []);
+  ctx.stroke(ic.p2d);
+  ctx.restore();
 }
 
-function handleHand(landmarks, nowMs) {
-  const W = canvas.width;
-  const H = canvas.height;
-  // Mirror x so the drawing matches the mirrored video.
-  // The Reach setting stretches hand movement around a comfortable centre point,
-  // so a small hand movement covers the whole screen (including the top buttons).
-  const gain = REACH_LEVELS[reachIdx];
-  const ax = W / 2;
-  const ay = H * REACH_ANCHOR_Y;
-  const pts = landmarks.map((p) => ({
-    x: ax + ((1 - p.x) * W - ax) * gain,
-    y: ay + (p.y * H - ay) * gain
-  }));
-  // The skeleton is drawn where your hand really is. Only the pen ring is stretched by Reach.
-  skeletonPts = landmarks.map((p) => ({ x: (1 - p.x) * W, y: p.y * H }));
-  realPen = {
-    x: (skeletonPts[4].x + skeletonPts[8].x) / 2,
-    y: (skeletonPts[4].y + skeletonPts[8].y) / 2
-  };
-
-  {
-    const a = Math.atan2(skeletonPts[9].y - skeletonPts[0].y, skeletonPts[9].x - skeletonPts[0].x);
-    handAng = handAng === null ? a : handAng + angDiff(a, handAng) * 0.35;
-  }
-  handVisible = true;
-  lastSeenMs = nowMs;
-
-  const handSize = Math.hypot(pts[0].x - pts[9].x, pts[0].y - pts[9].y);
-  const thumb = pts[4];
-  const index = pts[8];
-  const gap = Math.hypot(thumb.x - index.x, thumb.y - index.y);
-  const ratio = handSize > 0 ? gap / handSize : 1;
-  lastRatio = ratio;
-
-  const t = nowMs / 1000;
-  const rawX = Math.min(W, Math.max(0, (thumb.x + index.x) / 2));
-  const rawY = Math.min(H, Math.max(0, (thumb.y + index.y) / 2));
-  pen = { x: filterX.filter(rawX, t), y: filterY.filter(rawY, t) };
-  if (prevPenPos && t > prevPenT) {
-    const dt = t - prevPenT;
-    const vx = (pen.x - prevPenPos.x) / dt;
-    const vy = (pen.y - prevPenPos.y) / dt;
-    penVel.vx = penVel.vx * 0.6 + vx * 0.4;
-    penVel.vy = penVel.vy * 0.6 + vy * 0.4;
-    const inst = Math.hypot(vx, vy);
-    penSpeed = penSpeed * 0.6 + inst * 0.4;
-  }
-  prevPenPos = { x: pen.x, y: pen.y };
-  prevPenT = t;
-
-  const currentPose = classifyPose(skeletonPts);
-  const fistNow =
-    currentPose === "FIST" ||
-    currentPose === "SHAKA UP" ||
-    currentPose === "SHAKA DOWN" ||
-    handClosing(skeletonPts);
-
-  if (!pinching) {
-    if (ratio < PINCH_START && !fistNow && penSpeed < PINCH_MAX_SPEED) {
-      onCount++;
-      pending.push({ x: pen.x, y: pen.y });
-      if (onCount >= DEBOUNCE_FRAMES) {
-        pinching = true;
-        offCount = 0;
-        tabHold = null;
-        if (tabAt(pen)) {
-          // Pinching on the arrow tab: hold to open or hide the panel (no drawing).
-          tabHold = { startMs: nowMs, done: false };
-          current = null;
-        } else if (showBar && toolbarPanelAt(pen)) {
-          h1ToolbarTouch = {
-            startY: pen.y,
-            initialScroll: toolbarTargetScrollY,
-            targetBtn: buttonAt(pen),
-            isScrolling: false
-          };
-          current = null;
-        } else if (selected.size > 0 && h2.pinching) {
-          grabCandidate = null;
-          current = null;
-        } else {
-          const target = objectAtPoint(pen);
-          if (target) {
-            // Pinching on an object: hold still to pick it up, or move to draw instead.
-            grabCandidate = { obj: target, startX: pen.x, startY: pen.y, startMs: nowMs, pts: pending.slice() };
-            current = null;
-          } else {
-            current = pending.slice();
-          }
-        }
-      }
+function wrapText(text, maxW) {
+  const words = String(text || "").split(" ");
+  const lines = [];
+  let line = "";
+  for (const w of words) {
+    const test = line ? line + " " + w : w;
+    if (line && ctx.measureText(test).width > maxW) {
+      lines.push(line);
+      line = w;
     } else {
-      onCount = 0;
-      pending = [];
+      line = test;
     }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+// Small label box shown next to a button when the pen ring is moved onto it.
+function drawTip(a, title, desc) {
+  const fs = Math.max(12, Math.round(13 * Math.max(0.9, Math.min(1.1, canvas.width / 1100))));
+  const pad = 10;
+  const lineH = fs + 4;
+  ctx.save();
+  ctx.font = "bold " + fs + "px Arial";
+  const titleW = ctx.measureText(title).width;
+  ctx.font = (fs - 1) + "px Arial";
+  const lines = wrapText(desc, 190);
+  let w = titleW;
+  for (const l of lines) {
+    w = Math.max(w, ctx.measureText(l).width);
+  }
+  const boxW = Math.round(w + pad * 2);
+  const boxH = Math.round(pad * 2 + lineH * (1 + lines.length));
+  let x = dockRight ? a.x - 10 - boxW : a.x + a.w + 10;
+  x = Math.max(6, Math.min(canvas.width - boxW - 6, x));
+  let y = Math.round(a.y + a.h / 2 - boxH / 2);
+  y = Math.max(6, Math.min(canvas.height - boxH - 6, y));
+
+  roundRectPath(x, y, boxW, boxH, 8);
+  ctx.fillStyle = "rgba(10,12,18,0.9)";
+  ctx.fill();
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = "rgba(255,255,255,0.22)";
+  ctx.stroke();
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = "bold " + fs + "px Arial";
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(title, x + pad, y + pad + lineH * 0.5);
+  ctx.font = (fs - 1) + "px Arial";
+  ctx.fillStyle = "#b8c4d6";
+  lines.forEach((l, i) => ctx.fillText(l, x + pad, y + pad + lineH * (1.5 + i)));
+  ctx.restore();
+}
+
+function drawGestureBar(nowMs) {
+  if (!showBar) return;
+  layoutButtons();
+  const panel = toolbarPanelRect();
+  ctx.save();
+  roundRectPath(panel.x, panel.y, panel.w, panel.h, 16);
+  ctx.fillStyle = "rgba(12, 16, 24, 0.88)";
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+  ctx.stroke();
+
+  ctx.save();
+  roundRectPath(panel.x, panel.y + 4, panel.w, panel.h - 8, 14);
+  ctx.clip();
+  for (const b of gButtons) {
+    if (b.y + b.h < panel.y || b.y > panel.y + panel.h) continue;
+    const on = b.isOn ? b.isOn() : null;
+    const hot = dwellTarget === b;
+    const r = Math.round(b.h * 0.28);
+
+    roundRectPath(b.x, b.y, b.w, b.h, r);
+    ctx.fillStyle = b.danger ? "rgba(120,35,45,0.55)" : "rgba(16,20,28,0.6)";
+    ctx.fill();
+
+    // fill rises while the pen is held over the button
+    if (hot) {
+      const f = Math.min(1, (nowMs - dwellStart) / b.dwell);
+      ctx.save();
+      roundRectPath(b.x, b.y, b.w, b.h, r);
+      ctx.clip();
+      ctx.fillStyle = "rgba(56,232,255,0.45)";
+      ctx.fillRect(b.x, b.y + b.h * (1 - f), b.w, b.h * f);
+      ctx.restore();
+    }
+    // short flash after a press
+    if (flashButton === b && nowMs < flashUntil) {
+      roundRectPath(b.x, b.y, b.w, b.h, r);
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.fill();
+    }
+
+    roundRectPath(b.x, b.y, b.w, b.h, r);
+    ctx.lineWidth = hot ? 2 : 1.5;
+    ctx.strokeStyle = hot
+      ? "rgba(120,240,255,0.95)"
+      : (b.danger ? "rgba(255,140,150,0.6)" : "rgba(255,255,255,0.25)");
+    ctx.stroke();
+
+    const color = b.danger
+      ? "#ff9aa5"
+      : (on === true ? "#5dffa8" : (on === false ? "#8b93a3" : "#ffffff"));
+    drawIcon(b.icon, b.x + b.w / 2, b.y + b.h / 2, Math.round(b.h * 0.5), color);
+
+    // small count badge (number of selected objects)
+    const n = b.badge ? b.badge() : 0;
+    if (n > 0) {
+      ctx.beginPath();
+      ctx.arc(b.x + b.w - 6, b.y + 6, 8, 0, Math.PI * 2);
+      ctx.fillStyle = "#5dffa8";
+      ctx.fill();
+      ctx.font = "bold 11px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#08210f";
+      ctx.fillText(String(n), b.x + b.w - 6, b.y + 7);
+    }
+  }
+
+  ctx.restore();
+
+  if (toolbarMinScroll < 0) {
+    const trackH = panel.h - 28;
+    const thumbH = Math.max(20, trackH * (panel.h / (panel.h - toolbarMinScroll)));
+    const fraction = toolbarTargetScrollY / toolbarMinScroll;
+    const thumbY = panel.y + 14 + (trackH - thumbH) * fraction;
+    const thumbX = dockRight ? panel.x + 4 : panel.x + panel.w - 8;
+    roundRectPath(thumbX, thumbY, 4, thumbH, 2);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
+    ctx.fill();
+  }
+
+  // tooltip for the button the pen ring is over
+  const activePen = (pen && !pinching) ? pen : ((h2.pen && !h2.pinching) ? h2.pen : null);
+  const hoverBtn = activePen ? buttonAt(activePen) : null;
+  if (hoverBtn) {
+    const t = hoverBtn.tip();
+    drawTip(hoverBtn, t[0], t[1]);
+  }
+  ctx.restore();
+}
+
+// ------------------------------------------------------------
+// Arrow tab on the screen edge: pinch and hold on it to open or hide the dock.
+// ------------------------------------------------------------
+function tabRect() {
+  const panel = toolbarPanelRect();
+  const scale = Math.max(0.85, Math.min(1.15, canvas.width / 1100));
+  const w = Math.round(28 * scale);
+  const h = Math.round(64 * scale);
+  let x;
+  if (!showBar) {
+    x = dockRight ? canvas.width - w : 0;                 // hugging the screen edge
   } else {
-    if (ratio > PINCH_STOP) {
-      offCount++;
-      if (offCount >= DEBOUNCE_FRAMES) {
-        endPinch();
-      }
-    } else {
-      offCount = 0;
-      if (h1ToolbarTouch) {
-        const deltaY = pen.y - h1ToolbarTouch.startY;
-        if (!h1ToolbarTouch.isScrolling && Math.abs(deltaY) > TOOLBAR_DRAG_SLOP) {
-          h1ToolbarTouch.isScrolling = true;
-          h1ToolbarTouch.targetBtn = null;
-        }
-        if (h1ToolbarTouch.isScrolling) {
-          const adjusted = deltaY > 0 ? deltaY - TOOLBAR_DRAG_SLOP : deltaY + TOOLBAR_DRAG_SLOP;
-          setToolbarScroll(h1ToolbarTouch.initialScroll + adjusted * 0.95);
-        }
-      } else if (grabbed) {
-        // the held object follows the pen (see stepPhysics)
-      } else if (tabHold) {
-        const overTab = tabAt(pen);
-        if (tabHold.done) {
-          // already switched: wait for you to release the pinch
-        } else if (!overTab) {
-          tabHold.startMs = nowMs;   // sliding off the tab restarts the hold
-        } else if (nowMs - tabHold.startMs >= TAB_HOLD_MS) {
-          toggleBar();
-          tabHold.done = true;
-        }
-      } else if (grabCandidate) {
-        const gc = grabCandidate;
-        const lastPt = gc.pts[gc.pts.length - 1];
-        if (dist(pen, lastPt) >= MIN_POINT_GAP) gc.pts.push({ x: pen.x, y: pen.y });
-        if (dist(pen, { x: gc.startX, y: gc.startY }) > GRAB_MOVE_TOL) {
-          // you moved before the hold time was up: this is drawing, not grabbing
-          current = gc.pts.slice();
-          grabCandidate = null;
-        } else if (nowMs - gc.startMs >= GRAB_HOLD_MS) {
-          startGrab(gc.obj);
-          grabCandidate = null;
-        }
-      } else if (current) {
-        const last = current[current.length - 1];
-        if (Math.hypot(pen.x - last.x, pen.y - last.y) >= MIN_POINT_GAP) {
-          current.push({ x: pen.x, y: pen.y });
-        }
-      }
-    }
+    x = dockRight ? panel.x - w - 4 : panel.x + panel.w + 4;
   }
-  updatePose(nowMs);
+  return { x: x, y: Math.round(canvas.height / 2 - h / 2), w: w, h: h };
 }
 
-function handleNoHand(nowMs) {
-  const missingMs = nowMs - lastSeenMs;
-  // Short-dropout velocity prediction keeps cursor smooth across 1-2 missed camera frames
-  if (handVisible && pen && missingMs > 0 && missingMs <= PREDICT_GAP_MS) {
-    const dt = 0.016;
-    pen.x = Math.min(canvas.width, Math.max(0, pen.x + penVel.vx * dt * 0.5));
-    pen.y = Math.min(canvas.height, Math.max(0, pen.y + penVel.vy * dt * 0.5));
-    return;
-  }
-  if (handVisible && missingMs > DROPOUT_END_MS) {
-    handVisible = false;
-    pen = null;
-    skeletonPts = null;
-    realPen = null;
-    filterX.reset();
-    filterY.reset();
-    if (pinching) endPinch();
-    onCount = 0;
-    pending = [];
-    resetPose();
-    prevPenPos = null;
-    penSpeed = 0;
-    penVel = { vx: 0, vy: 0 };
-  }
-}
-
-function handleHand2(lm, nowMs) {
-  const W = canvas.width;
-  const H = canvas.height;
-  const g = REACH_LEVELS[reachIdx];
-  const ax = W / 2;
-  const ay = H * REACH_ANCHOR_Y;
-  const mapPoint = (p) => ({
-    x: ax + ((1 - p.x) * W - ax) * g,
-    y: ay + (p.y * H - ay) * g
-  });
-  const pts = lm.map(mapPoint);
-  const th = pts[4];
-  const ix = pts[8];
-  const w = pts[0];
-  const mid = pts[9];
-  const skeleton = lm.map((p) => ({ x: (1 - p.x) * W, y: p.y * H }));
-  const realPen2 = { x: (skeleton[4].x + skeleton[8].x) / 2, y: (skeleton[4].y + skeleton[8].y) / 2 };
-  const rawX = Math.min(W, Math.max(0, (th.x + ix.x) / 2));
-  const rawY = Math.min(H, Math.max(0, (th.y + ix.y) / 2));
-  const t = nowMs / 1000;
-  h2.seen = nowMs;
-  h2.visible = true;
-  h2.skeletonPts = skeleton;
-  h2.realPen = realPen2;
-  const a = Math.atan2(skeleton[9].y - skeleton[0].y, skeleton[9].x - skeleton[0].x);
-  h2.ang = h2.ang === undefined || h2.ang === null ? a : h2.ang + angDiff(a, h2.ang) * 0.35;
-  h2.pen = { x: filterX2.filter(rawX, t), y: filterY2.filter(rawY, t) };
-  if (!h2.vis) h2.vis = { x: h2.pen.x, y: h2.pen.y };
-  const dt = t - (h2.prevPenT || t);
-  if (h2.prevPenPos && dt > 0) {
-    const vx = (h2.pen.x - h2.prevPenPos.x) / dt;
-    const vy = (h2.pen.y - h2.prevPenPos.y) / dt;
-    h2.penVel.vx = h2.penVel.vx * 0.6 + vx * 0.4;
-    h2.penVel.vy = h2.penVel.vy * 0.6 + vy * 0.4;
-    h2.penSpeed = h2.penSpeed * 0.6 + Math.hypot(vx, vy) * 0.4;
-  }
-  h2.prevPenPos = { x: h2.pen.x, y: h2.pen.y };
-  h2.prevPenT = t;
-  const size = Math.hypot(w.x - mid.x, w.y - mid.y);
-  const ratio = size > 0 ? Math.hypot(th.x - ix.x, th.y - ix.y) / size : 1;
-  h2.lastRatio = ratio;
-  const pose = classifyPose(skeleton);
-  const fistNow = pose === "FIST" || pose === "SHAKA UP" || pose === "SHAKA DOWN" || handClosing(skeleton);
-
-  if (!h2.pinching) {
-    if (ratio < PINCH_START && !fistNow && h2.penSpeed < PINCH_MAX_SPEED) {
-      h2.on++;
-      h2.pending.push({ x: h2.pen.x, y: h2.pen.y });
-      if (h2.on >= DEBOUNCE_FRAMES) {
-        h2.pinching = true;
-        h2.pinch = true;
-        h2.off = 0;
-        if (tabAt(h2.pen)) {
-          toggleBar();
-          h2.current = null;
-        } else if (showBar && toolbarPanelAt(h2.pen)) {
-          h2ToolbarTouch = {
-            startY: h2.pen.y,
-            initialScroll: toolbarTargetScrollY,
-            targetBtn: buttonAt(h2.pen),
-            isScrolling: false
-          };
-          h2.current = null;
-        } else if (showBar && buttonAt(h2.pen)) {
-          pressButton(buttonAt(h2.pen), nowMs);
-          h2.current = null;
-        } else if (selected.size > 0 && pinching) {
-          h2.current = null;
-          h2.grabCandidate = null;
-        } else {
-          const target = objectAtPoint(h2.pen);
-          if (target && !(grabbed && grabbed.obj === target && !target.isMerged)) {
-            h2.grabCandidate = {
-              obj: target,
-              startX: h2.pen.x,
-              startY: h2.pen.y,
-              startMs: nowMs,
-              pts: h2.pending.slice()
-            };
-            h2.current = null;
-          } else {
-            h2.grabCandidate = null;
-            h2.current = h2.pending.slice();
-          }
-        }
-      }
-    } else {
-      h2.on = 0;
-      h2.pending = [];
-    }
+function tabAt(p) {
+  if (!p) return false;
+  const t = tabRect();
+  let inX;
+  if (!showBar) {
+    inX = dockRight ? p.x >= t.x - 10 : p.x <= t.x + t.w + 10;   // reaches the screen edge
   } else {
-    if (ratio > PINCH_STOP) {
-      if (++h2.off >= DEBOUNCE_FRAMES) {
-        if (h2ToolbarTouch) {
-          if (!h2ToolbarTouch.isScrolling) {
-            const button = h2ToolbarTouch.targetBtn || buttonAt(h2.pen);
-            if (button) pressButton(button, nowMs);
-          }
-          h2ToolbarTouch = null;
-        }
-        if (h2.grab) releaseGrab2();
-        if (h2.current && !scaleSession) {
-          const prevLast = objects[objects.length - 1];
-          const strokeLength = pathLength(h2.current);
-          commitStroke(h2.current);
-          const last = objects[objects.length - 1];
-          if (last && last !== prevLast) {
-            h2.lastStrokeObj = last;
-            h2.lastStrokeObj.strokeLen = strokeLength;
-            h2.lastStrokeAt = nowMs;
-          }
-        }
-        h2.current = null;
-        h2.grabCandidate = null;
-        h2.pinching = false;
-        h2.pinch = false;
-        h2.on = 0;
-        h2.off = 0;
-        h2.pending = [];
-        h2.poseBlockUntil = nowMs + POSE_POST_PINCH_MS;
-      }
-    } else {
-      h2.off = 0;
-      if (h2ToolbarTouch) {
-        const deltaY = h2.pen.y - h2ToolbarTouch.startY;
-        if (!h2ToolbarTouch.isScrolling && Math.abs(deltaY) > TOOLBAR_DRAG_SLOP) {
-          h2ToolbarTouch.isScrolling = true;
-          h2ToolbarTouch.targetBtn = null;
-        }
-        if (h2ToolbarTouch.isScrolling) {
-          const adjusted = deltaY > 0 ? deltaY - TOOLBAR_DRAG_SLOP : deltaY + TOOLBAR_DRAG_SLOP;
-          setToolbarScroll(h2ToolbarTouch.initialScroll + adjusted * 0.95);
-        }
-      } else if (scaleSession) {
-        h2.current = null;
-      } else if (h2.grab) {
-        // The held body is moved by the physics step.
-      } else if (h2.grabCandidate) {
-        const candidate = h2.grabCandidate;
-        const lastPoint = candidate.pts[candidate.pts.length - 1];
-        if (dist(h2.pen, lastPoint) >= MIN_POINT_GAP) candidate.pts.push({ x: h2.pen.x, y: h2.pen.y });
-        if (dist(h2.pen, { x: candidate.startX, y: candidate.startY }) > GRAB_MOVE_TOL) {
-          h2.current = candidate.pts.slice();
-          h2.grabCandidate = null;
-        } else if (nowMs - candidate.startMs >= GRAB_HOLD_MS) {
-          startGrab2(candidate.obj);
-          h2.grabCandidate = null;
-        }
-      } else if (h2.current) {
-        const lastPoint = h2.current[h2.current.length - 1];
-        if (dist(h2.pen, lastPoint) >= MIN_POINT_GAP) h2.current.push({ x: h2.pen.x, y: h2.pen.y });
-      }
-    }
+    inX = p.x >= t.x - 6 && p.x <= t.x + t.w + 6;
   }
-  updatePose2(nowMs);
+  return inX && p.y >= t.y - 8 && p.y <= t.y + t.h + 8;
 }
 
-function updatePose2(nowMs) {
-  const real = h2.skeletonPts;
-  if (!real || h2.pinching || h2.grab || h2.grabCandidate || h2ToolbarTouch || nowMs < h2.poseBlockUntil) {
-    h2.candPose = null;
-    h2.candFired = false;
-    h2.wristHist = [];
-    return;
-  }
-  const raw = classifyPose(real);
-  const openish = raw === "OPEN PALM" || (raw === null && extendedCount(real) >= 3);
-  h2.swipeProgress = 0;
-  if (openish && h2.penSpeed > 300) {
-    const center = palmCenter(real);
-    h2.wristHist.push({ x: center.x, y: center.y, t: nowMs });
-    h2.wristHist = h2.wristHist.filter((point) => nowMs - point.t <= SWIPE_WINDOW_MS);
-    if (h2.wristHist.length >= 3) {
-      const xs = h2.wristHist.map((point) => point.x);
-      const ys = h2.wristHist.map((point) => point.y);
-      const dx = Math.max(...xs) - Math.min(...xs);
-      const dy = Math.max(...ys) - Math.min(...ys);
-      const net = Math.abs(h2.wristHist[h2.wristHist.length - 1].x - h2.wristHist[0].x);
-      const need = Math.max(canvas.width * SWIPE_MIN_FRACTION, dist(real[0], real[9]) * SWIPE_MIN_HANDS);
-      if (dy < dx * 0.7 && net >= dx * 0.7) h2.swipeProgress = Math.min(1, dx / need);
-      if (h2.swipeProgress >= 1 && nowMs >= h2.swipeCooldownUntil) {
-        runAction(SWIPE_ACTION);
-        h2.swipeCooldownUntil = nowMs + SWIPE_COOLDOWN_MS;
-        h2.poseBlockUntil = nowMs + POSE_POST_PINCH_MS;
-        h2.candPose = null;
-        h2.candFired = false;
-        return;
-      }
-    }
-  } else {
-    h2.wristHist = [];
+function drawTab(nowMs) {
+  const t = tabRect();
+  const r = Math.round(t.w * 0.4);
+  const over = pen ? tabAt(pen) : false;
+  const holding = !!(tabHold && !tabHold.done && over);
+
+  roundRectPath(t.x, t.y, t.w, t.h, r);
+  ctx.fillStyle = "rgba(16,20,28,0.55)";
+  ctx.fill();
+
+  if (holding) {
+    const f = Math.min(1, (nowMs - tabHold.startMs) / TAB_HOLD_MS);
+    ctx.save();
+    roundRectPath(t.x, t.y, t.w, t.h, r);
+    ctx.clip();
+    ctx.fillStyle = "rgba(56,232,255,0.45)";
+    ctx.fillRect(t.x, t.y + t.h * (1 - f), t.w, t.h * f);
+    ctx.restore();
   }
 
-  let pose = tabAt(h2.pen) || (showBar && toolbarPanelAt(h2.pen)) ? null : raw;
-  if (pose === "OPEN PALM" && h2.hoverObj && !pausedWorld) pose = null;
-  if (pose === "OPEN PALM" && selected.size > 0 && nowMs - lastSelectMs < SELECT_SETTLE_MS) pose = null;
-  if (pose) h2.lastPoseMs = nowMs;
-  if (!pose && h2.candPose && nowMs - h2.lastPoseMs < POSE_GRACE_MS) return;
-  const size = dist(real[0], real[9]);
-  if (pose && pose === h2.candPose && h2.candWrist && dist(real[0], h2.candWrist) > size * POSE_MOVE_TOL) {
-    h2.candStartMs = nowMs;
-    h2.candWrist = { x: real[0].x, y: real[0].y };
-    h2.candFired = false;
-  }
-  if (pose !== h2.candPose) {
-    h2.candPose = pose;
-    h2.candStartMs = nowMs;
-    h2.candFired = false;
-    h2.candWrist = pose ? { x: real[0].x, y: real[0].y } : null;
-  }
-  const holdTime = h2.candPose && POSE_HOLD_MS[h2.candPose] ? POSE_HOLD_MS[h2.candPose] : 500;
-  if (h2.candPose && !h2.candFired && nowMs - h2.candStartMs >= holdTime) {
-    h2.candFired = true;
-    runAction(GESTURE_ACTIONS[h2.candPose]);
+  roundRectPath(t.x, t.y, t.w, t.h, r);
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = (holding || over) ? "rgba(120,240,255,0.95)" : "rgba(255,255,255,0.35)";
+  ctx.stroke();
+
+  // arrow: points toward the side it will move the panel
+  const pointsLeft = dockRight !== showBar;
+  const d = pointsLeft ? -1 : 1;
+  const cx = t.x + t.w / 2;
+  const cy = t.y + t.h / 2;
+  ctx.beginPath();
+  ctx.moveTo(cx - d * 4, cy - 9);
+  ctx.lineTo(cx + d * 4, cy);
+  ctx.lineTo(cx - d * 4, cy + 9);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "#ffffff";
+  ctx.stroke();
+
+  if (over) {
+    drawTip(
+      t,
+      "Button panel",
+      showBar ? "Pinch and hold to hide the panel." : "Pinch and hold to open the panel."
+    );
   }
 }
 
-function selecting2() {
-  return false;
-}
+// ------------------------------------------------------------
+// Settings, materials, sound, save/load, redo
+// ------------------------------------------------------------
+var audioCtx = null;
+var lastToneMs = 0;
 
-function handleNoHand2(nowMs) {
-  // Forgive short tracking drop-outs so the held object is not dropped on a single missed frame.
-  if (nowMs !== undefined && h2.seen && nowMs - h2.seen < 250) return;
-  if (h2.grab) releaseGrab2();
-  if (h2.pinching && h2.current && !scaleSession) commitStroke(h2.current);
-  h2.visible = false;
-  h2.pen = null;
-  h2.vis = null;
-  h2.skeletonPts = null;
-  h2.realPen = null;
-  h2.current = null;
-  h2.grabCandidate = null;
-  h2ToolbarTouch = null;
-  h2.pinching = false;
-  h2.pinch = false;
-  h2.on = 0;
-  h2.off = 0;
-  h2.pending = [];
-  h2.penSpeed = 0;
-  h2.penVel = { vx: 0, vy: 0 };
-  h2.prevPenPos = null;
-  h2.wristHist = [];
-  h2.candPose = null;
-  h2.candFired = false;
-  filterX2.reset();
-  filterY2.reset();
-}
-
-function rawPinchMidpoint(landmarks) {
-  return {
-    x: (1 - (landmarks[4].x + landmarks[8].x) / 2) * canvas.width,
-    y: ((landmarks[4].y + landmarks[8].y) / 2) * canvas.height
-  };
-}
-
-// One hand-tracking pass on the newest camera frame.
-function trackFrame() {
-  if (!landmarker || video.readyState < 2) return;
-  const t0 = performance.now();
-  let result;
+function playTone(freq, dur) {
+  const t = performance.now();
+  if (!soundOn || t - lastToneMs < 60) return;
+  lastToneMs = t;
   try {
-    result = landmarker.detectForVideo(video, t0);
-  } catch (error) {
-    return;
-  }
-  const t1 = performance.now();
-  trackMs = trackMs * 0.9 + (t1 - t0) * 0.1;
-  if (result.landmarks && result.landmarks.length > 0) {
-    const L = result.landmarks;
-    _hadHand = true;
-    if (L.length === 1) {
-      const point = rawPinchMidpoint(L[0]);
-      const d1 = realPen ? dist(point, realPen) : Infinity;
-      const d2 = h2.realPen ? dist(point, h2.realPen) : Infinity;
-      if ((h2.visible && !handVisible) || (h2.visible && handVisible && d2 < d1)) {
-        handleHand2(L[0], t1);
-        handleNoHand(t1);
-      } else {
-        handleHand(L[0], t1);
-        handleNoHand2(t1);
-      }
-    } else {
-      const points = [rawPinchMidpoint(L[0]), rawPinchMidpoint(L[1])];
-      let firstIsHand1;
-      if (realPen && h2.realPen) {
-        firstIsHand1 = dist(points[0], realPen) + dist(points[1], h2.realPen) <=
-          dist(points[1], realPen) + dist(points[0], h2.realPen);
-      } else if (realPen) {
-        firstIsHand1 = dist(points[0], realPen) <= dist(points[1], realPen);
-      } else if (h2.realPen) {
-        firstIsHand1 = dist(points[1], h2.realPen) <= dist(points[0], h2.realPen);
-      } else {
-        firstIsHand1 = points[0].x <= points[1].x;
-      }
-      handleHand(L[firstIsHand1 ? 0 : 1], t1);
-      handleHand2(L[firstIsHand1 ? 1 : 0], t1);
-    }
-  } else {
-    if (_hadHand) {
-      _hadHand = false;
-      handLosses.push(t1);
-    }
-    handleNoHand(t1);
-    handleNoHand2(t1);
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.frequency.value = freq;
+    g.gain.value = 0.05;
+    g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+    o.connect(g);
+    g.connect(audioCtx.destination);
+    o.start();
+    o.stop(audioCtx.currentTime + dur);
+  } catch (e) {
+    // no audio
   }
 }
 
-// Best case: run tracking right when the browser says a new camera frame is ready.
-function onVideoFrame() {
-  trackFrame();
-  video.requestVideoFrameCallback(onVideoFrame);
-}
-
-// ------------------------------------------------------------
-// Mouse backup input (always works, also handy for testing physics)
-// ------------------------------------------------------------
-function toCanvas(e) {
-  const rect = canvas.getBoundingClientRect();
+function serObj(o) {
+  if (o.isMerged && o.body && o.subParts) {
+    const b = o.body;
+    const c = Math.cos(b.angle), sn = Math.sin(b.angle);
+    const toWorld = (arr) => arr.map((p) => ({
+      x: b.position.x + p.x * c - p.y * sn,
+      y: b.position.y + p.x * sn + p.y * c
+    }));
+    return {
+      k: "compound",
+      shapeType: o.shapeType,
+      behaviorText: o.behaviorText,
+      hue: o.hue,
+      scaleMultiplier: o.scaleMultiplier || 1,
+      components: o.subParts.map((part) => ({
+        k: part.kind,
+        shapeType: part.shapeType,
+        behaviorText: part.behaviorText,
+        hue: part.hue,
+        wellRadius: part.wellRadius,
+        spiralDir: part.spiralDir,
+        v: toWorld(part.local),
+        s: toWorld(part.polyLocal)
+      }))
+    };
+  }
+  if (o.kind === "platform") {
+    return {
+      k: "platform",
+      shapeType: o.shapeType,
+      color: o.color,
+      raw: o.raw.map((p) => ({ x: p.x, y: p.y }))
+    };
+  }
+  const b = o.body;
+  const c = Math.cos(b.angle);
+  const sn = Math.sin(b.angle);
+  const w = (arr) => arr.map((p) => ({
+    x: b.position.x + p.x * c - p.y * sn,
+    y: b.position.y + p.x * sn + p.y * c
+  }));
   return {
-    x: (e.clientX - rect.left) * (canvas.width / rect.width),
-    y: (e.clientY - rect.top) * (canvas.height / rect.height)
+    k: o.kind,
+    shapeType: o.shapeType,
+    behaviorText: o.behaviorText,
+    color: o.color,
+    hue: o.hue,
+    wellRadius: o.wellRadius,
+    spiralDir: o.spiralDir,
+    v: w(o.local),
+    s: w(o.kind === "solid" ? o.polyLocal : (o.lineLocal || o.local))
   };
 }
 
-canvas.addEventListener("pointerdown", (e) => {
-  const p0 = toCanvas(e);
-  if (tabAt(p0)) {
-    toggleBar();
-    return;
-  }
-  if (showBar && toolbarPanelAt(p0)) {
-    mouseToolbarTouch = {
-      startY: p0.y,
-      initialScroll: toolbarTargetScrollY,
-      targetBtn: buttonAt(p0),
-      isScrolling: false
-    };
-    canvas.setPointerCapture(e.pointerId);
-    return;
-  }
-  if (e.shiftKey) {
-    const picked = objectAtPoint(p0);
-    if (picked) toggleSelect(picked);
-    return;
-  }
-  mouseCurrent = [p0];
-  canvas.setPointerCapture(e.pointerId);
-});
-
-canvas.addEventListener("pointermove", (e) => {
-  const p = toCanvas(e);
-  if (mouseToolbarTouch) {
-    const deltaY = p.y - mouseToolbarTouch.startY;
-    if (!mouseToolbarTouch.isScrolling && Math.abs(deltaY) > TOOLBAR_DRAG_SLOP) {
-      mouseToolbarTouch.isScrolling = true;
-      mouseToolbarTouch.targetBtn = null;
+function deserObj(d) {
+  let ok = false;
+  if (d.k === "compound" && typeof addCompoundObject === "function") {
+    ok = addCompoundObject(d.components);
+  } else if (d.k === "platform") {
+    ok = addPlatform(d.raw, d.raw, d.shapeType);
+  } else if (d.k === "spring" && typeof addSpring === "function") {
+    ok = addSpring(d.v, d.s);
+  } else if (d.k === "cup" && typeof addCup === "function") {
+    ok = addCup(d.v, d.s);
+  } else if (d.k === "spiral" && typeof addSpiralWell === "function") {
+    ok = addSpiralWell(d.v, {
+      center: centroid(d.v),
+      radius: d.wellRadius || 38,
+      dir: d.spiralDir || 1
+    });
+  } else if (d.k === "solid") {
+    if (d.shapeType === "Circle" && typeof addCircleObject === "function") {
+      const bb = boundsOf(d.s);
+      ok = addCircleObject(d.v, {
+        center: centroid(d.s),
+        radius: Math.max(12, (bb.w + bb.h) / 4),
+        poly: d.s
+      });
+    } else {
+      ok = addSolid(d.v, d.s, d.shapeType, d.behaviorText);
     }
-    if (mouseToolbarTouch.isScrolling) {
-      const adjusted = deltaY > 0 ? deltaY - TOOLBAR_DRAG_SLOP : deltaY + TOOLBAR_DRAG_SLOP;
-      setToolbarScroll(mouseToolbarTouch.initialScroll + adjusted * 0.95);
-    }
-    return;
+  } else {
+    ok = addFallingLine(d.v, d.s, d.shapeType);
   }
-  if (!mouseCurrent) return;
-  const last = mouseCurrent[mouseCurrent.length - 1];
-  if (dist(p, last) >= MIN_POINT_GAP) mouseCurrent.push(p);
-});
-
-function finishMouseStroke(e) {
-  if (mouseToolbarTouch) {
-    if (!mouseToolbarTouch.isScrolling) {
-      const point = e ? toCanvas(e) : null;
-      const button = mouseToolbarTouch.targetBtn || (point ? buttonAt(point) : null);
-      if (button) pressButton(button, performance.now());
-    }
-    mouseToolbarTouch = null;
-    return;
+  if (ok && d.hue !== undefined && typeof objects !== "undefined" && objects.length > 0) {
+    objects[objects.length - 1].hue = d.hue;
   }
-  if (mouseCurrent) commitStroke(mouseCurrent);
-  mouseCurrent = null;
+  if (ok && typeof objects !== "undefined" && objects.length > 0) {
+    if (isValidDrawingColor(d.color)) objects[objects.length - 1].color = d.color;
+    if (Number.isFinite(d.scaleMultiplier)) objects[objects.length - 1].scaleMultiplier = d.scaleMultiplier;
+    assignLocalObjectIdentity(objects[objects.length - 1]);
+  }
+  return ok;
 }
 
-canvas.addEventListener("pointerup", finishMouseStroke);
-canvas.addEventListener("pointercancel", finishMouseStroke);
-canvas.addEventListener("wheel", (e) => {
-  const point = toCanvas(e);
-  if (toolbarPanelAt(point)) {
-    e.preventDefault();
-    setToolbarScroll(toolbarTargetScrollY - e.deltaY * 0.7);
+function saveScene() {
+  try {
+    localStorage.setItem("physdraw.scene", JSON.stringify(objects.map(serObj)));
+    if (typeof showToast === "function") showToast("Saved");
+  } catch (e) {
+    if (typeof showToast === "function") showToast("Could not save");
   }
-}, { passive: false });
-canvas.addEventListener("dblclick", (e) => {
-  const p = toCanvas(e);
-  if (tabAt(p) || (showBar && buttonAt(p))) return;
-  spawnTestBall(p.x, p.y);
-});
+}
+
+function loadScene() {
+  try {
+    const d = JSON.parse(localStorage.getItem("physdraw.scene") || "null");
+    if (!d) {
+      if (typeof showToast === "function") showToast("Nothing saved");
+      return;
+    }
+    if (typeof clearObjects === "function") clearObjects();
+    if (typeof clearMoves === "function") clearMoves();
+    for (const x of d) {
+      if (deserObj(x)) {
+        const created = objects[objects.length - 1];
+        if (typeof window.broadcastObjectCreation === "function") {
+          window.broadcastObjectCreation(created);
+        }
+      }
+    }
+    if (typeof showToast === "function") showToast("Loaded");
+  } catch (e) {
+    if (typeof showToast === "function") showToast("Could not load");
+  }
+}
+
+function redoLast() {
+  const d = redoStack.pop();
+  if (!d) {
+    if (typeof showToast === "function") showToast("Nothing to redo");
+    return;
+  }
+  if (deserObj(d) && typeof window.broadcastObjectCreation === "function") {
+    window.broadcastObjectCreation(objects[objects.length - 1]);
+  }
+  if (typeof showToast === "function") showToast("Redid drawing");
+}
+
+function saveSettings() {
+  try {
+    localStorage.setItem("physdraw.settings", JSON.stringify({
+      v: SETTINGS.map((x) => x[4]()),
+      matIdx: matIdx,
+      soundOn: soundOn,
+      perfMode: perfMode,
+      drawingColor: drawingColor
+    }));
+  } catch (e) {
+    // ignore
+  }
+}
+
+function applyPerf() {
+  if (typeof MAX_PARTICLES !== "undefined") {
+    MAX_PARTICLES = perfMode ? 80 : 360;
+  }
+}
+
+function ensureDomElement(id, tag, text) {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement(tag);
+    el.id = id;
+    if (text) el.innerHTML = text;
+    document.body.appendChild(el);
+  }
+  return el;
+}
+
+function buildPanel() {
+  try {
+    const d = JSON.parse(localStorage.getItem("physdraw.settings") || "null");
+    if (d && typeof SETTINGS !== "undefined") {
+      SETTINGS.forEach((x, i) => {
+        if (d.v && typeof d.v[i] === "number") x[5](d.v[i]);
+      });
+      matIdx = d.matIdx | 0;
+      soundOn = d.soundOn !== false;
+      perfMode = !!d.perfMode;
+      if (isValidDrawingColor(d.drawingColor)) drawingColor = d.drawingColor;
+      if (drawingColorInput) drawingColorInput.value = drawingColor;
+      applyPerf();
+    }
+  } catch (e) {
+    // ignore
+  }
+  const btn = ensureDomElement("cfgBtn", "button", "&#9881;");
+  const box = ensureDomElement("cfg", "div");
+  box.innerHTML = "";
+  btn.onclick = () => {
+    box.style.display = box.style.display === "block" ? "none" : "block";
+  };
+  if (typeof SETTINGS !== "undefined") {
+    for (const [label, mn, mx, st, get, set] of SETTINGS) {
+      const l = document.createElement("label");
+      const out = document.createElement("span");
+      const r = document.createElement("input");
+      r.type = "range";
+      r.min = mn;
+      r.max = mx;
+      r.step = st;
+      r.value = get();
+      out.textContent = " " + get();
+      l.textContent = label;
+      l.appendChild(out);
+      r.oninput = () => {
+        set(Number(r.value));
+        out.textContent = " " + r.value;
+        saveSettings();
+      };
+      box.appendChild(l);
+      box.appendChild(r);
+    }
+  }
+  const lm = document.createElement("label");
+  lm.textContent = "Next object material";
+  const sel = document.createElement("select");
+  if (typeof MATERIALS !== "undefined") {
+    MATERIALS.forEach((m, i) => {
+      const o = document.createElement("option");
+      o.value = i;
+      o.textContent = m.n;
+      sel.appendChild(o);
+    });
+  }
+  sel.value = matIdx;
+  sel.onchange = () => {
+    matIdx = Number(sel.value);
+    saveSettings();
+  };
+  box.appendChild(lm);
+  box.appendChild(sel);
+
+  const mk = (t, f) => {
+    const b = document.createElement("button");
+    b.textContent = t;
+    b.onclick = f;
+    box.appendChild(b);
+    return b;
+  };
+  mk("Save", saveScene);
+  mk("Load", loadScene);
+  mk("Redo", redoLast);
+  const snd = mk("Sound: " + (soundOn ? "on" : "off"), () => {
+    soundOn = !soundOn;
+    snd.textContent = "Sound: " + (soundOn ? "on" : "off");
+    saveSettings();
+  });
+  const pf = mk("Performance: " + (perfMode ? "on" : "off"), () => {
+    perfMode = !perfMode;
+    applyPerf();
+    pf.textContent = "Performance: " + (perfMode ? "on" : "off");
+    saveSettings();
+  });
+  const lb = mk("Shape labels: " + (getShowLabels() ? "on" : "off"), () => {
+    setShowLabels(!getShowLabels());
+    lb.textContent = "Shape labels: " + (getShowLabels() ? "on" : "off");
+  });
+}
+
+function extraPanel() {
+  const box = ensureDomElement("cfg", "div");
+  const mk = (t, f) => {
+    const b = document.createElement("button");
+    b.textContent = t;
+    b.onclick = f;
+    box.appendChild(b);
+    return b;
+  };
+  const lab = document.createElement("label");
+  lab.textContent = "Link type (select 2 objects first)";
+  const sel = document.createElement("select");
+  ["Spring", "Rope", "Hinge"].forEach((n) => {
+    const o = document.createElement("option");
+    o.textContent = n;
+    sel.appendChild(o);
+  });
+  sel.onchange = () => {
+    linkType = sel.value;
+  };
+  box.appendChild(lab);
+  box.appendChild(sel);
+  mk("Link", () => {
+    if (typeof linkSelected === "function") linkSelected();
+  });
+  mk("Unlink", () => {
+    if (typeof unlinkSelected === "function") unlinkSelected();
+  });
+  const rt = mk("Hand rotation: on", () => {
+    rotateOn = !rotateOn;
+    rt.textContent = "Hand rotation: " + (rotateOn ? "on" : "off");
+  });
+  const rl = document.createElement("label");
+  rl.textContent = "Rotation strength";
+  const rr = document.createElement("input");
+  rr.type = "range";
+  rr.min = 0.5;
+  rr.max = 2;
+  rr.step = 0.1;
+  rr.value = 1;
+  rr.oninput = () => {
+    rotGain = Number(rr.value);
+  };
+  box.appendChild(rl);
+  box.appendChild(rr);
+  const fz = mk("Push frozen: " + (pushFrozen ? "on" : "off"), () => {
+    setPushFrozen(!pushFrozen);
+  });
+  fz.id = "pushFrozenBtn";
+}
+
+// ------------------------------------------------------------
+// Lighting / tracking hint
+// ------------------------------------------------------------
+function lightingHint() {
+  const el = ensureDomElement("hint", "div");
+  const c = document.createElement("canvas");
+  c.width = 32;
+  c.height = 24;
+  const cx = c.getContext("2d", { willReadFrequently: true });
+  let luma = 128;
+  let since = 0;
+  setInterval(() => {
+    const now = performance.now();
+    try {
+      if (video && video.readyState >= 2) {
+        cx.drawImage(video, 0, 0, 32, 24);
+        const d = cx.getImageData(0, 0, 32, 24).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        }
+        luma = luma * 0.5 + (sum / (d.length / 4)) * 0.5;
+      }
+    } catch (e) {
+      return;
+    }
+    while (handLosses.length && now - handLosses[0] > 10000) {
+      handLosses.shift();
+    }
+    let m = "";
+    if (luma < 55) {
+      m = "Too dark \u2013 turn on a light or face a window so your hand is easier to see";
+    } else if (luma > 210) {
+      m = "Too bright or backlit \u2013 avoid a bright window behind your hand";
+    } else if (handLosses.length >= 5) {
+      m = "Hand keeps getting lost \u2013 keep it fully in view and move a bit slower";
+    }
+    // show only after the problem lasts 2 s, hide once it is gone
+    if (m) {
+      if (!since) since = now;
+    } else {
+      since = 0;
+    }
+    if (m && now - since > 2000) {
+      el.textContent = m;
+      el.style.display = "block";
+    } else if (!m) {
+      el.style.display = "none";
+    }
+  }, 600);
+}
+
+// ------------------------------------------------------------
+// Main loop
+// ------------------------------------------------------------
+function loop() {
+  requestAnimationFrame(loop);
+  const nowMs = performance.now();
+
+  // Fallback for browsers without requestVideoFrameCallback: check for a new frame every screen frame.
+  if (!useVFC && video && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    if (typeof trackFrame === "function") trackFrame();
+  }
+
+  updateDwell(nowMs);
+  if (typeof updateHoverSelect === "function") updateHoverSelect(nowMs);
+  if (typeof stepPhysics === "function") stepPhysics(nowMs);
+
+  // Draw bodies between their last two physics states so motion stays smooth on any refresh rate.
+  const saved = [];
+  const stepDur = typeof STEP_MS !== "undefined" ? STEP_MS : (1000 / 60);
+  const acc = typeof accumulator !== "undefined" ? accumulator : 0;
+  const alpha = pausedWorld ? 1 : Math.min(1, acc / stepDur);
+  if (alpha < 1 && typeof objects !== "undefined") {
+    for (const o of objects) {
+      for (const b of o.bodies) {
+        const q = b._ip;
+        const heldBy1 = grabbed && grabbed.obj && grabbed.obj.body === b;
+        const heldBy2 = typeof h2 !== "undefined" && h2.grab && h2.grab.obj && h2.grab.obj.body === b;
+        if (
+          b.isStatic ||
+          !q ||
+          heldBy1 ||
+          heldBy2 ||
+          Math.abs(b.position.x - q.x) > 150 ||
+          Math.abs(b.position.y - q.y) > 150
+        ) {
+          continue;
+        }
+        saved.push([b, b.position.x, b.position.y, b.angle]);
+        b.position.x = q.x + (b.position.x - q.x) * alpha;
+        b.position.y = q.y + (b.position.y - q.y) * alpha;
+        b.angle = q.a + (b.angle - q.a) * alpha;
+      }
+    }
+  }
+  try {
+    render();
+  } catch (err) {
+    console.error("render error:", err);
+  } finally {
+    for (const r of saved) {
+      r[0].position.x = r[1];
+      r[0].position.y = r[2];
+      r[0].angle = r[3];
+    }
+  }
+  updateStatus();
+
+  fpsFrames++;
+  if (nowMs - fpsStart >= 500) {
+    fps = Math.round((fpsFrames * 1000) / (nowMs - fpsStart));
+    fpsFrames = 0;
+    fpsStart = nowMs;
+  }
+}
+
+// ------------------------------------------------------------
+// Start (waits until all scripts and DOM elements are ready)
+// ------------------------------------------------------------
+async function init() {
+  try {
+    if (statusEl) statusEl.textContent = "Starting camera. Click Allow if the browser asks.";
+    if (typeof startCamera === "function") await startCamera();
+    if (typeof buildWalls === "function") buildWalls();
+    layoutButtons();
+    syncButtons();
+    if (statusEl) statusEl.textContent = "Loading hand tracker. This needs internet and takes a few seconds.";
+    if (typeof startTracker === "function") await startTracker();
+    if (statusEl) statusEl.textContent = "Ready. Show your hand to the camera.";
+    if (typeof lastFrameMs !== "undefined") lastFrameMs = performance.now();
+    if (useVFC && video && typeof onVideoFrame === "function") {
+      video.requestVideoFrameCallback(onVideoFrame);
+    }
+    loop();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = err.friendly || ("Error: " + err.message);
+  }
+}
+
+function startUiWhenReady() {
+  initToolbarIcons();
+  buildPanel();
+  extraPanel();
+  lightingHint();
+  syncButtons();
+  init();
+}
+
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", startUiWhenReady);
+} else {
+  setTimeout(startUiWhenReady, 0);
+}
