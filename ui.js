@@ -29,6 +29,14 @@ function setShowLabels(val) {
   }
 }
 
+const drawingColorInput = document.getElementById("drawingColor");
+if (drawingColorInput) {
+  drawingColorInput.addEventListener("input", () => {
+    drawingColor = drawingColorInput.value;
+    saveSettings();
+  });
+}
+
 if (typeof window.smoothCurve !== "function") {
   window.smoothCurve = function (points) {
     if (!points || points.length < 3) return points || [];
@@ -94,6 +102,51 @@ function initToolbarIcons() {
   });
 }
 initToolbarIcons();
+
+const videoStage = document.getElementById("wrap");
+const videoLayoutButtons = Array.from(document.querySelectorAll("[data-video-layout]"));
+const videoFocusToggle = document.getElementById("videoFocusToggle");
+let activeVideoLayout = "pip";
+let focusedVideo = "local";
+
+function updateVideoLayout() {
+  if (!videoStage) return;
+  videoStage.dataset.layout = activeVideoLayout;
+  videoStage.dataset.focus = focusedVideo;
+  for (const button of videoLayoutButtons) {
+    button.setAttribute("aria-pressed", String(button.dataset.videoLayout === activeVideoLayout));
+  }
+  if (videoFocusToggle) {
+    videoFocusToggle.textContent = focusedVideo === "local" ? "Show partner" : "Show me";
+    videoFocusToggle.setAttribute("aria-label", focusedVideo === "local"
+      ? "Show partner video full screen"
+      : "Show your video full screen");
+  }
+}
+
+for (const button of videoLayoutButtons) {
+  button.addEventListener("click", () => {
+    activeVideoLayout = button.dataset.videoLayout;
+    if (activeVideoLayout === "focus") focusedVideo = "local";
+    updateVideoLayout();
+  });
+}
+
+if (videoFocusToggle) {
+  videoFocusToggle.addEventListener("click", () => {
+    focusedVideo = focusedVideo === "local" ? "remote" : "local";
+    updateVideoLayout();
+  });
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && activeVideoLayout === "focus" && focusedVideo === "remote") {
+    focusedVideo = "local";
+    updateVideoLayout();
+  }
+});
+
+updateVideoLayout();
 
 // ------------------------------------------------------------
 // Drawing on the overlay canvas
@@ -183,7 +236,8 @@ function drawObjectLabel(o, pts) {
   const now = performance.now();
   const age = now - (o.born || 0);
   const selSet = typeof selected !== "undefined" ? selected : null;
-  const isHot = (selSet && selSet.has(o)) || hoverObj === o || (grabbed && grabbed.obj === o);
+  const isHot = (selSet && selSet.has(o)) || hoverObj === o || (grabbed && grabbed.obj === o) ||
+    (typeof h2 !== "undefined" && (h2.hoverObj === o || (h2.grab && h2.grab.obj === o)));
 
   // For generic freeform Blobs and Lines, only show the label when hovered, selected, or held
   const isGeneric = o.shapeType === "Blob" || o.shapeType === "Line";
@@ -215,7 +269,7 @@ function drawObjectLabel(o, pts) {
   ctx.fillStyle = "rgba(10, 14, 22, 0.85)";
   ctx.fill();
   ctx.lineWidth = 1;
-  ctx.strokeStyle = "hsl(" + (o.hue || 190) + ", 100%, 65%)";
+  ctx.strokeStyle = o.color || "hsl(" + (o.hue || 190) + ", 100%, 65%)";
   ctx.stroke();
 
   ctx.fillStyle = "#e8f4ff";
@@ -224,6 +278,8 @@ function drawObjectLabel(o, pts) {
   ctx.fillText(text, cx, y + h / 2 + 0.5);
   ctx.restore();
 }
+
+let _liveClassifyCache = { time: 0, info: null, len: 0 };
 
 // Live dotted-line shape preview while drawing a stroke.
 // ONLY appears when `info.snapPoints` is non-null (a specific shape was matched).
@@ -238,7 +294,12 @@ function drawLiveShapePreview(rawStroke) {
     if (pathLength(smoothed) < minLen) return;
     if (typeof classifyShape !== "function") return;
 
-    const info = classifyShape(smoothed);
+    const now = performance.now();
+    let info = _liveClassifyCache.info;
+    if (now - _liveClassifyCache.time >= 150 || Math.abs(rawStroke.length - _liveClassifyCache.len) > 5) {
+      info = classifyShape(smoothed);
+      _liveClassifyCache = { time: now, info, len: rawStroke.length };
+    }
     // Do NOT show any dotted preview if this is a normal freeform line or blob (snapPoints === null)
     if (!info || !info.snapPoints || info.snapPoints.length < 2) return;
 
@@ -246,22 +307,7 @@ function drawLiveShapePreview(rawStroke) {
     const closed = !!info.closed;
     const vertices = info.vertices || [];
 
-    let color = "#5dffa8";
-    if (info.type === "circle") color = "#ffd34e";
-    else if (info.type === "zigzag") color = "#ff66d9";
-    else if (info.type === "spiral") color = "#c56bff";
-    else if (info.type === "star") color = "#ffee55";
-    else if (info.type === "cup") color = "#ff9f43";
-    else if (info.type === "diamond") color = "#38e8ff";
-    else if (
-      info.type === "triangle" ||
-      info.type === "square" ||
-      info.type === "rectangle" ||
-      info.type === "pentagon" ||
-      info.type === "hexagon"
-    ) {
-      color = "#5dffa8";
-    }
+    const color = drawingColor;
 
     ctx.save();
 
@@ -334,20 +380,45 @@ function getWorldPointsSafe(o) {
 
 function drawObject(o) {
   if (!o) return;
-  const held = grabbed && grabbed.obj === o;
-  const cand = grabCandidate && grabCandidate.obj === o;
-  const glow = held ? "#ffffff" : "hsl(" + o.hue + ", 100%, 60%)";
-  const core = "hsl(" + o.hue + ", 100%, " + (held ? 92 : 78) + "%)";
+  const held = (grabbed && grabbed.obj === o) || (typeof h2 !== "undefined" && h2.grab && h2.grab.obj === o);
+  const cand = (grabCandidate && grabCandidate.obj === o) || (typeof h2 !== "undefined" && h2.grabCandidate && h2.grabCandidate.obj === o);
+  const glow = held ? "#ffffff" : (o.color || "hsl(" + o.hue + ", 100%, 60%)");
+  const core = o.color ? (held ? "#ffffff" : o.color) : "hsl(" + o.hue + ", 100%, " + (held ? 92 : 78) + "%)";
   const wide = held ? 6 : (cand ? 5.5 : 4.5);
   let pts;
+
+  if (o.isMerged && o.subParts && o.body) {
+    const body = o.body;
+    const c = Math.cos(body.angle), s = Math.sin(body.angle);
+    for (const part of o.subParts) {
+      const partPts = part.local.map((p) => ({
+        x: body.position.x + p.x * c - p.y * s,
+        y: body.position.y + p.x * s + p.y * c
+      }));
+      const scaledPart = popScaled(o, partPts);
+      if (scaledPart.length < 2) continue;
+      buildPath(scaledPart);
+      if (part.kind === "solid" || scaledPart.length > 2) {
+        ctx.closePath();
+        ctx.fillStyle = "hsla(" + (part.hue || o.hue) + ", 100%, 60%, 0.24)";
+        ctx.fill();
+      }
+      neonStroke(held ? "#ffffff" : "hsl(" + (part.hue || o.hue) + ", 100%, 60%)", core, wide);
+    }
+    drawObjectLabel(o, popScaled(o, getWorldPointsSafe(o)));
+    return;
+  }
 
   if (o.kind === "solid") {
     pts = popScaled(o, getWorldPointsSafe(o));
     if (pts.length < 3) return;
     buildPath(pts);
     ctx.closePath();
-    ctx.fillStyle = "hsla(" + o.hue + ", 100%, 60%, 0.22)";
+    ctx.save();
+    ctx.globalAlpha *= 0.22;
+    ctx.fillStyle = o.color || "hsl(" + o.hue + ", 100%, 60%)";
     ctx.fill();
+    ctx.restore();
     neonStroke(glow, core, wide);
   } else {
     const rawPts = o.kind === "platform" ? o.raw : getWorldPointsSafe(o);
@@ -364,7 +435,8 @@ function drawObject(o) {
       ctx.arc(o.body.position.x, o.body.position.y, pulseR, 0, Math.PI * 2);
       ctx.setLineDash([5, 7]);
       ctx.lineWidth = 1.5;
-      ctx.strokeStyle = "rgba(197, 107, 255, 0.45)";
+      ctx.globalAlpha = 0.45;
+      ctx.strokeStyle = o.color || "#c56bff";
       ctx.stroke();
       ctx.restore();
     }
@@ -374,6 +446,26 @@ function drawObject(o) {
 
 // Dashed green outline around selected objects.
 function drawSelection(o) {
+  if (o.isMerged && o.subParts && o.body) {
+    const body = o.body;
+    const c = Math.cos(body.angle), s = Math.sin(body.angle);
+    ctx.save();
+    ctx.setLineDash([12, 9]);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#7dffb0";
+    for (const part of o.subParts) {
+      const pts = part.local.map((p) => ({
+        x: body.position.x + p.x * c - p.y * s,
+        y: body.position.y + p.x * s + p.y * c
+      }));
+      if (pts.length < 2) continue;
+      buildPath(pts);
+      if (part.kind === "solid" || pts.length > 2) ctx.closePath();
+      ctx.stroke();
+    }
+    ctx.restore();
+    return;
+  }
   const pts = o.kind === "platform" ? o.raw : getWorldPointsSafe(o);
   if (!pts || pts.length < 2) return;
   buildPath(pts);
@@ -398,6 +490,80 @@ function drawHitbox(b) {
     }
     ctx.closePath();
     ctx.stroke();
+  }
+}
+
+function drawShockwaves() {
+  if (typeof shockwaves === "undefined" || shockwaves.length === 0) return;
+  ctx.save();
+  for (let i = shockwaves.length - 1; i >= 0; i--) {
+    const wave = shockwaves[i];
+    wave.r += wave.speed;
+    wave.alpha = Math.max(0, 1 - wave.r / wave.maxR);
+    if (wave.alpha <= 0) {
+      shockwaves.splice(i, 1);
+      continue;
+    }
+    ctx.beginPath();
+    ctx.arc(wave.x, wave.y, wave.r, 0, Math.PI * 2);
+    ctx.lineWidth = Math.max(2, 8 * wave.alpha);
+    ctx.strokeStyle = "hsla(" + wave.hue + ", 100%, 75%, " + wave.alpha + ")";
+    ctx.shadowColor = "hsl(" + wave.hue + ", 100%, 70%)";
+    ctx.shadowBlur = 20;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawInteractionVisuals(nowMs) {
+  if (scaleSession && scaleSession.target && pen && h2.pen) {
+    const first = penVis || pen;
+    const second = h2.vis || h2.pen;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    ctx.lineTo(second.x, second.y);
+    ctx.setLineDash([6, 6]);
+    ctx.lineDashOffset = -(nowMs / 20) % 12;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#38e8ff";
+    ctx.shadowColor = "#38e8ff";
+    ctx.shadowBlur = 12;
+    ctx.stroke();
+    ctx.restore();
+    drawChip("Scale: " + Math.round((scaleSession.target.scaleMultiplier || 1) * 100) + "%",
+      Math.round((first.x + second.x) / 2), Math.round((first.y + second.y) / 2 - 24), "#38e8ff", 1);
+  }
+
+  if (mergeCandidate && mergeProgress > 0) {
+    const bodyA = mergeCandidate.objA.body || mergeCandidate.objA.bodies[0];
+    const bodyB = mergeCandidate.objB.body || mergeCandidate.objB.bodies[0];
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(bodyA.position.x, bodyA.position.y);
+    ctx.lineTo(bodyB.position.x, bodyB.position.y);
+    ctx.lineWidth = 3 + mergeProgress * 4;
+    ctx.strokeStyle = "rgba(215, 120, 255, " + (0.4 + mergeProgress * 0.6) + ")";
+    ctx.shadowColor = "#e077ff";
+    ctx.shadowBlur = 14;
+    ctx.stroke();
+    ctx.restore();
+    drawChip("Merging", Math.round(mergeCandidate.midX), Math.round(mergeCandidate.midY - 28), "#e077ff", mergeProgress);
+  }
+
+  if (demergeCandidate && demergeProgress > 0.08 && pen && h2.pen) {
+    const first = penVis || pen;
+    const second = h2.vis || h2.pen;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(first.x, first.y);
+    ctx.lineTo(second.x, second.y);
+    ctx.setLineDash([7, 5]);
+    ctx.lineWidth = 3 + demergeProgress * 5;
+    ctx.strokeStyle = demergeProgress > 0.65 ? "#ff4757" : "#ffa502";
+    ctx.stroke();
+    ctx.restore();
+    drawChip("Splitting", Math.round((first.x + second.x) / 2), Math.round((first.y + second.y) / 2 - 28), "#ffa502", demergeProgress);
   }
 }
 
@@ -450,6 +616,11 @@ function drawPoseUI(nowMs) {
     const f = Math.min(1, (nowMs - candStartMs) / POSE_HOLD_MS[candPose]);
     const label = typeof poseLabel === "function" ? poseLabel(candPose) : candPose;
     drawChip(label, cx, 44, "#38e8ff", f);
+  } else if (typeof h2 !== "undefined" && h2.candPose && !h2.candFired) {
+    const hold = POSE_HOLD_MS[h2.candPose] || 500;
+    const f = Math.min(1, (nowMs - h2.candStartMs) / hold);
+    const label = typeof poseLabel === "function" ? poseLabel(h2.candPose) : h2.candPose;
+    drawChip(label, cx, 44, "#5dff9a", f);
   }
 }
 
@@ -467,6 +638,16 @@ function render() {
     }
   } else {
     penVis = null;
+  }
+  if (typeof h2 !== "undefined" && h2.pen) {
+    if (!h2.vis) h2.vis = { x: h2.pen.x, y: h2.pen.y };
+    else {
+      const f = 1 - Math.exp(-(nowR - lastRenderMs) / 16);
+      h2.vis.x += (h2.pen.x - h2.vis.x) * f;
+      h2.vis.y += (h2.pen.y - h2.vis.y) * f;
+    }
+  } else if (typeof h2 !== "undefined") {
+    h2.vis = null;
   }
   lastRenderMs = nowR;
 
@@ -541,6 +722,14 @@ function render() {
     ctx.lineWidth = 3;
     ctx.strokeStyle = h2.grab ? "#5dff9a" : (h2.pinch ? "#ffb347" : "#ffffff");
     ctx.stroke();
+    if (h2.grabCandidate) {
+      const progress = Math.min(1, (nowR - h2.grabCandidate.startMs) / GRAB_HOLD_MS);
+      ctx.beginPath();
+      ctx.arc(h2.pen.x, h2.pen.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
+      ctx.strokeStyle = "#ffb020";
+      ctx.lineWidth = 5;
+      ctx.stroke();
+    }
   }
 
   // sparks
@@ -548,7 +737,7 @@ function render() {
     for (const p of particles) {
       ctx.globalAlpha = Math.max(0, 1 - p.life / p.max);
       if (p.hue !== undefined) {
-        ctx.strokeStyle = "hsl(" + p.hue + ", 100%, 70%)";
+        ctx.strokeStyle = p.color || "hsl(" + p.hue + ", 100%, 70%)";
         ctx.lineWidth = 3;
       } else {
         ctx.strokeStyle = "#bff6ff";
@@ -561,6 +750,8 @@ function render() {
     }
     ctx.globalAlpha = 1;
   }
+  drawShockwaves();
+  drawInteractionVisuals(nowR);
 
   // strokes being drawn right now (hand and mouse), smoothed for display + live dotted preview
   if (current && typeof smoothStroke === "function") {
@@ -571,13 +762,26 @@ function render() {
     const live = window.smoothCurve(smoothStroke(rawWithTip, 2));
     if (live.length >= 2) {
       buildPath(live);
-      neonStroke("#38e8ff", "#a8f6ff", 4.5);
+      neonStroke(drawingColor, drawingColor, 4.5);
       drawLiveShapePreview(rawWithTip);
+    }
+  }
+  if (typeof h2 !== "undefined" && h2.current && typeof smoothStroke === "function") {
+    const rawWithTip2 = h2.current.slice();
+    const pen2 = h2.vis || h2.pen;
+    if (h2.pinching && pen2 && rawWithTip2.length > 0 && dist(rawWithTip2[rawWithTip2.length - 1], pen2) > 0.5) {
+      rawWithTip2.push({ x: pen2.x, y: pen2.y });
+    }
+    const live2 = window.smoothCurve(smoothStroke(rawWithTip2, 2));
+    if (live2.length >= 2) {
+      buildPath(live2);
+      neonStroke("#5dff9a", "#caffd8", 4.5);
+      drawLiveShapePreview(rawWithTip2);
     }
   }
   if (mouseCurrent && mouseCurrent.length >= 2 && typeof smoothStroke === "function") {
     buildPath(window.smoothCurve(smoothStroke(mouseCurrent, 2)));
-    neonStroke("#38e8ff", "#a8f6ff", 4.5);
+    neonStroke(drawingColor, drawingColor, 4.5);
     drawLiveShapePreview(mouseCurrent);
   }
 
@@ -630,6 +834,25 @@ function render() {
     }
   }
 
+  if (showSkeleton && typeof h2 !== "undefined" && h2.skeletonPts && typeof HAND_CONNECTIONS !== "undefined") {
+    const pts2 = h2.skeletonPts;
+    ctx.strokeStyle = "rgba(80,220,255,0.8)";
+    ctx.lineWidth = 2;
+    for (const [a, b] of HAND_CONNECTIONS) {
+      if (!pts2[a] || !pts2[b]) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts2[a].x, pts2[a].y);
+      ctx.lineTo(pts2[b].x, pts2[b].y);
+      ctx.stroke();
+    }
+    ctx.fillStyle = "rgba(255,255,255,0.9)";
+    for (const p of pts2) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
   // gesture bar buttons
   drawGestureBar(performance.now());
   drawTab(performance.now());
@@ -666,17 +889,19 @@ function updateStatus() {
   const nowS = performance.now();
   if (nowS - lastStatusMs < 200) return;
   lastStatusMs = nowS;
-  let mode = "Ready";
-  if (grabbed && grabbed.obj) mode = "Holding " + (grabbed.obj.shapeType || "object");
-  else if (grabCandidate) mode = "Hold still to grab";
-  else if (tabHold) mode = "Button panel";
-  else if (pinching) mode = "Drawing";
-  else if (hoverObj) mode = "Selecting " + (hoverObj.shapeType || "object");
+  const handCount = (handVisible ? 1 : 0) + ((typeof h2 !== "undefined" && h2.visible) ? 1 : 0);
+  const handText = handCount === 2 ? "2 Hands tracked" : (handCount === 1 ? "1 Hand tracked" : "No hand");
+  const actions = [];
+  if (grabbed && grabbed.obj) actions.push("H1 holding " + (grabbed.obj.shapeType || "object"));
+  else if (pinching) actions.push("H1 drawing");
+  if (typeof h2 !== "undefined" && h2.grab && h2.grab.obj) actions.push("H2 holding " + (h2.grab.obj.shapeType || "object"));
+  else if (typeof h2 !== "undefined" && h2.pinching) actions.push("H2 drawing");
+  const mode = actions.length ? actions.join(" & ") : (tabHold || h1ToolbarTouch || h2ToolbarTouch ? "Button panel" : "Ready");
   if (pausedWorld) mode += " (paused)";
   const objCount = typeof objects !== "undefined" ? objects.length : 0;
   if (statusEl) {
     statusEl.textContent =
-      (handVisible ? "Hand tracked" : "No hand") +
+      handText +
       "   |   " + mode +
       "   |   " + objCount + " objects" +
       "   |   " + fps + " fps" +
@@ -703,23 +928,65 @@ function clearAll() {
   if (typeof clearObjects === "function") clearObjects();
   if (typeof clearMoves === "function") clearMoves();
   current = null;
+  if (typeof h2 !== "undefined") {
+    h2.current = null;
+    h2.grabCandidate = null;
+    h2.pending = [];
+    h2.pinching = false;
+    h2.pinch = false;
+  }
+  h1ToolbarTouch = null;
+  h2ToolbarTouch = null;
+  mouseToolbarTouch = null;
   mouseCurrent = null;
   pinching = false;
   cancelled = 0;
   lastInfo = "none yet";
+  if (typeof showToast === "function") showToast("Cleared your shapes");
 }
 
 function toggleGravity() {
-  gravityOn = !gravityOn;
+  setGravityEnabled(!gravityOn);
+}
+
+function setGravityEnabled(enabled, broadcast = true) {
+  gravityOn = enabled;
   if (typeof engine !== "undefined" && engine.gravity) {
     engine.gravity.y = gravityOn ? 1 : 0;
   }
   syncButtons();
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
+}
+
+function setPausedWorld(paused, broadcast = true) {
+  pausedWorld = paused;
+  syncButtons();
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
 }
 
 function toggleLines() {
-  linesFall = !linesFall;
+  setLinesFall(!linesFall);
+}
+
+function setLinesFall(enabled, broadcast = true) {
+  linesFall = enabled;
   syncButtons();
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
+}
+
+function setPushFrozen(enabled, broadcast = true) {
+  pushFrozen = enabled;
+  const button = document.getElementById("pushFrozenBtn");
+  if (button) button.textContent = "Push frozen: " + (pushFrozen ? "on" : "off");
+  if (broadcast && typeof window.broadcastWorldState === "function") {
+    window.broadcastWorldState();
+  }
 }
 
 function toggleHitboxes() {
@@ -781,7 +1048,7 @@ function syncButtons() {
   );
   setBtn(cloneBtn, "Clone selected\nMakes a copy of each selected object.", false, n);
   setBtn(destroyBtn, "Destroy selected\nShatters the selected objects.", false, n);
-  setBtn(clearBtn, "Clear all\nDeletes every drawing.", false);
+  setBtn(clearBtn, "Clear your shapes\nDeletes every shape you created.", false);
   setBtn(
     hitboxBtn,
     "Hitboxes: " + (showHitboxes ? "ON" : "OFF") + "\nShows the real physics shapes, to check collisions.",
@@ -952,42 +1219,73 @@ var gButtons = [
     action: () => clearAll(),
     dwell: DWELL_DANGER_MS,
     danger: true,
-    tip: () => ["Clear all", "Deletes every drawing. Keep holding to confirm."]
+    tip: () => ["Clear your shapes", "Deletes every shape you created. Keep holding to confirm."]
   }
 ];
+
+var toolbarScrollY = 0;
+var toolbarTargetScrollY = 0;
+var toolbarMinScroll = 0;
+var toolbarMaxScroll = 0;
+
+function toolbarPanelRect() {
+  const width = canvas.width || 1280;
+  const height = canvas.height || 720;
+  const scale = Math.max(0.85, Math.min(1.15, width / 1100));
+  const size = Math.round(48 * scale);
+  const gap = Math.round(7 * scale);
+  const margin = Math.round(9 * scale);
+  const panelH = Math.min(height - 70, 6 * size + 5 * gap + margin * 2);
+  const panelW = size + margin * 2;
+  const x = dockRight ? width - panelW - 6 : 6;
+  return { x: x, y: Math.round((height - panelH) / 2), w: panelW, h: panelH, size: size, gap: gap, margin: margin };
+}
+
+function toolbarPanelAt(point) {
+  if (!point || !showBar) return false;
+  const rect = toolbarPanelRect();
+  return point.x >= rect.x - 8 && point.x <= rect.x + rect.w + 8 &&
+    point.y >= rect.y - 6 && point.y <= rect.y + rect.h + 6;
+}
+
+function setToolbarScroll(value) {
+  toolbarTargetScrollY = Math.max(toolbarMinScroll, Math.min(toolbarMaxScroll, value));
+}
 
 function toggleDock() {
   dockRight = !dockRight;
   dwellTarget = null;
+  toolbarScrollY = 0;
+  toolbarTargetScrollY = 0;
   layoutButtons();
   syncButtons();
 }
 
 function layoutButtons() {
-  const scale = Math.max(0.85, Math.min(1.15, canvas.width / 1100));
-  const size = Math.round(46 * scale);
-  const gap = Math.round(5 * scale);
-  const margin = Math.round(10 * scale);
-  const total = gButtons.length * size + (gButtons.length - 1) * gap;
-  const x = dockRight ? canvas.width - margin - size : margin;
-  let y = Math.round((canvas.height - total) / 2);
+  const rect = toolbarPanelRect();
+  const total = gButtons.length * rect.size + (gButtons.length - 1) * rect.gap;
+  const innerH = rect.h - rect.margin * 2;
+  toolbarMinScroll = Math.min(0, innerH - total);
+  toolbarMaxScroll = 0;
+  toolbarScrollY += (toolbarTargetScrollY - toolbarScrollY) * 0.32;
+  let y = rect.y + rect.margin + toolbarScrollY;
   for (const b of gButtons) {
-    b.x = x;
+    b.x = rect.x + rect.margin;
     b.y = y;
-    b.w = size;
-    b.h = size;
-    y += size + gap;
+    b.w = rect.size;
+    b.h = rect.size;
+    y += rect.size + rect.gap;
   }
 }
 
 function buttonAt(p) {
-  if (!p) return null;
+  if (!p || !showBar || !toolbarPanelAt(p)) return null;
+  const rect = toolbarPanelRect();
   for (const b of gButtons) {
     if (b.x === undefined || b.y === undefined) continue;
-    // The press zone is bigger than the button: it reaches the screen edge and fills the small gaps.
-    const inX = dockRight ? p.x >= b.x - 12 : p.x <= b.x + b.w + 12;
-    const inY = p.y >= b.y - 3 && p.y <= b.y + b.h + 3;
-    if (inX && inY) return b;
+    const visible = b.y + b.h >= rect.y + rect.margin && b.y <= rect.y + rect.h - rect.margin;
+    if (visible && p.x >= b.x - 8 && p.x <= b.x + b.w + 8 &&
+        p.y >= b.y - 4 && p.y <= b.y + b.h + 4) return b;
   }
   return null;
 }
@@ -1110,9 +1408,21 @@ function drawTip(a, title, desc) {
 
 function drawGestureBar(nowMs) {
   if (!showBar) return;
-  if (gButtons[0] && gButtons[0].x === undefined) layoutButtons();
+  layoutButtons();
+  const panel = toolbarPanelRect();
   ctx.save();
+  roundRectPath(panel.x, panel.y, panel.w, panel.h, 16);
+  ctx.fillStyle = "rgba(12, 16, 24, 0.88)";
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+  ctx.stroke();
+
+  ctx.save();
+  roundRectPath(panel.x, panel.y + 4, panel.w, panel.h - 8, 14);
+  ctx.clip();
   for (const b of gButtons) {
+    if (b.y + b.h < panel.y || b.y > panel.y + panel.h) continue;
     const on = b.isOn ? b.isOn() : null;
     const hot = dwellTarget === b;
     const r = Math.round(b.h * 0.28);
@@ -1165,8 +1475,22 @@ function drawGestureBar(nowMs) {
     }
   }
 
+  ctx.restore();
+
+  if (toolbarMinScroll < 0) {
+    const trackH = panel.h - 28;
+    const thumbH = Math.max(20, trackH * (panel.h / (panel.h - toolbarMinScroll)));
+    const fraction = toolbarTargetScrollY / toolbarMinScroll;
+    const thumbY = panel.y + 14 + (trackH - thumbH) * fraction;
+    const thumbX = dockRight ? panel.x + 4 : panel.x + panel.w - 8;
+    roundRectPath(thumbX, thumbY, 4, thumbH, 2);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
+    ctx.fill();
+  }
+
   // tooltip for the button the pen ring is over
-  const hoverBtn = (pen && !pinching) ? buttonAt(pen) : null;
+  const activePen = (pen && !pinching) ? pen : ((h2.pen && !h2.pinching) ? h2.pen : null);
+  const hoverBtn = activePen ? buttonAt(activePen) : null;
   if (hoverBtn) {
     const t = hoverBtn.tip();
     drawTip(hoverBtn, t[0], t[1]);
@@ -1178,7 +1502,7 @@ function drawGestureBar(nowMs) {
 // Arrow tab on the screen edge: pinch and hold on it to open or hide the dock.
 // ------------------------------------------------------------
 function tabRect() {
-  if (gButtons[0] && gButtons[0].x === undefined) layoutButtons();
+  const panel = toolbarPanelRect();
   const scale = Math.max(0.85, Math.min(1.15, canvas.width / 1100));
   const w = Math.round(28 * scale);
   const h = Math.round(64 * scale);
@@ -1186,8 +1510,7 @@ function tabRect() {
   if (!showBar) {
     x = dockRight ? canvas.width - w : 0;                 // hugging the screen edge
   } else {
-    const b = gButtons[0];
-    x = dockRight ? b.x - w - 6 : b.x + b.w + 6;          // just inside the open dock
+    x = dockRight ? panel.x - w - 4 : panel.x + panel.w + 4;
   }
   return { x: x, y: Math.round(canvas.height / 2 - h / 2), w: w, h: h };
 }
@@ -1278,10 +1601,36 @@ function playTone(freq, dur) {
 }
 
 function serObj(o) {
+  if (o.isMerged && o.body && o.subParts) {
+    const b = o.body;
+    const c = Math.cos(b.angle), sn = Math.sin(b.angle);
+    const toWorld = (arr) => arr.map((p) => ({
+      x: b.position.x + p.x * c - p.y * sn,
+      y: b.position.y + p.x * sn + p.y * c
+    }));
+    return {
+      k: "compound",
+      shapeType: o.shapeType,
+      behaviorText: o.behaviorText,
+      hue: o.hue,
+      scaleMultiplier: o.scaleMultiplier || 1,
+      components: o.subParts.map((part) => ({
+        k: part.kind,
+        shapeType: part.shapeType,
+        behaviorText: part.behaviorText,
+        hue: part.hue,
+        wellRadius: part.wellRadius,
+        spiralDir: part.spiralDir,
+        v: toWorld(part.local),
+        s: toWorld(part.polyLocal)
+      }))
+    };
+  }
   if (o.kind === "platform") {
     return {
       k: "platform",
       shapeType: o.shapeType,
+      color: o.color,
       raw: o.raw.map((p) => ({ x: p.x, y: p.y }))
     };
   }
@@ -1296,6 +1645,7 @@ function serObj(o) {
     k: o.kind,
     shapeType: o.shapeType,
     behaviorText: o.behaviorText,
+    color: o.color,
     hue: o.hue,
     wellRadius: o.wellRadius,
     spiralDir: o.spiralDir,
@@ -1306,7 +1656,9 @@ function serObj(o) {
 
 function deserObj(d) {
   let ok = false;
-  if (d.k === "platform") {
+  if (d.k === "compound" && typeof addCompoundObject === "function") {
+    ok = addCompoundObject(d.components);
+  } else if (d.k === "platform") {
     ok = addPlatform(d.raw, d.raw, d.shapeType);
   } else if (d.k === "spring" && typeof addSpring === "function") {
     ok = addSpring(d.v, d.s);
@@ -1335,6 +1687,11 @@ function deserObj(d) {
   if (ok && d.hue !== undefined && typeof objects !== "undefined" && objects.length > 0) {
     objects[objects.length - 1].hue = d.hue;
   }
+  if (ok && typeof objects !== "undefined" && objects.length > 0) {
+    if (isValidDrawingColor(d.color)) objects[objects.length - 1].color = d.color;
+    if (Number.isFinite(d.scaleMultiplier)) objects[objects.length - 1].scaleMultiplier = d.scaleMultiplier;
+    assignLocalObjectIdentity(objects[objects.length - 1]);
+  }
   return ok;
 }
 
@@ -1357,7 +1714,12 @@ function loadScene() {
     if (typeof clearObjects === "function") clearObjects();
     if (typeof clearMoves === "function") clearMoves();
     for (const x of d) {
-      deserObj(x);
+      if (deserObj(x)) {
+        const created = objects[objects.length - 1];
+        if (typeof window.broadcastObjectCreation === "function") {
+          window.broadcastObjectCreation(created);
+        }
+      }
     }
     if (typeof showToast === "function") showToast("Loaded");
   } catch (e) {
@@ -1371,7 +1733,9 @@ function redoLast() {
     if (typeof showToast === "function") showToast("Nothing to redo");
     return;
   }
-  deserObj(d);
+  if (deserObj(d) && typeof window.broadcastObjectCreation === "function") {
+    window.broadcastObjectCreation(objects[objects.length - 1]);
+  }
   if (typeof showToast === "function") showToast("Redid drawing");
 }
 
@@ -1381,7 +1745,8 @@ function saveSettings() {
       v: SETTINGS.map((x) => x[4]()),
       matIdx: matIdx,
       soundOn: soundOn,
-      perfMode: perfMode
+      perfMode: perfMode,
+      drawingColor: drawingColor
     }));
   } catch (e) {
     // ignore
@@ -1415,6 +1780,8 @@ function buildPanel() {
       matIdx = d.matIdx | 0;
       soundOn = d.soundOn !== false;
       perfMode = !!d.perfMode;
+      if (isValidDrawingColor(d.drawingColor)) drawingColor = d.drawingColor;
+      if (drawingColorInput) drawingColorInput.value = drawingColor;
       applyPerf();
     }
   } catch (e) {
@@ -1539,10 +1906,10 @@ function extraPanel() {
   };
   box.appendChild(rl);
   box.appendChild(rr);
-  const fz = mk("Push frozen: on", () => {
-    pushFrozen = !pushFrozen;
-    fz.textContent = "Push frozen: " + (pushFrozen ? "on" : "off");
+  const fz = mk("Push frozen: " + (pushFrozen ? "on" : "off"), () => {
+    setPushFrozen(!pushFrozen);
   });
+  fz.id = "pushFrozenBtn";
 }
 
 // ------------------------------------------------------------
