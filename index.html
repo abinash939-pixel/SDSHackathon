@@ -9,12 +9,32 @@
 <body>
   <header>Sketch2Sim</header>
 
-  <div id="wrap">
-    <video id="video" autoplay playsinline muted></video>
+  <div id="wrap" data-layout="pip" data-focus="local">
+    <div id="localVideoPane" class="videoPane">
+      <video id="video" autoplay playsinline muted></video>
+      <span class="videoLabel">You</span>
+    </div>
+    <div id="remoteVideoPane" class="videoPane">
+      <video id="remoteVideo" autoplay playsinline></video>
+      <span class="videoLabel">Partner</span>
+    </div>
     <canvas id="overlay"></canvas>
+    <button id="videoFocusToggle" type="button">Show partner</button>
   </div>
 
   <div id="controls">
+    <div id="multiplayerControls">
+      <span>Your ID: <strong id="myIdDisplay">Connecting...</strong></span>
+      <label id="drawingColorControl" for="drawingColor">Draw color <input id="drawingColor" type="color" value="#5dffa8"></label>
+      <input id="peerIdInput" type="text" placeholder="Friend's peer ID" aria-label="Friend's peer ID">
+      <button id="connectBtn" type="button">Connect</button>
+      <button id="micToggleBtn" class="tb" type="button" data-icon="mic" aria-label="Mute microphone" title="Mute microphone" aria-pressed="false"><svg viewBox="0 0 24 24"></svg></button>
+      <div id="videoLayoutControls" role="group" aria-label="Video layout">
+        <button type="button" data-video-layout="split" aria-pressed="false">Split</button>
+        <button type="button" data-video-layout="pip" aria-pressed="true">PiP</button>
+        <button type="button" data-video-layout="focus" aria-pressed="false">Focus</button>
+      </div>
+    </div>
     <div id="toolbar">
       <div class="group">
         <button id="gravityBtn" class="tb" data-icon="gravity"><svg viewBox="0 0 24 24"></svg><span class="badge"></span></button>
@@ -47,6 +67,7 @@
       Peace sign (two fingers up) = clone the selected objects. Fist held for one second = destroy the selected objects.<br>
       Open palm = deselect all (or pause and resume if nothing is selected). Swipe an open hand sideways = erase hovered/selected object or undo last drawing.<br>
       The button panel has the same powers if you prefer it.<br>
+      In a video call, both people share one live physics space: shapes and their motion stay synchronized. Pause/resume and gravity controls affect both participants; either person can clone selected shapes. Only the creator can move or erase a shape, but all shapes still collide and affect each other.<br>
       Mouse backup: drag to draw, double-click drops a ball, shift-click selects.
     </div>
     <div id="status">Starting...</div>
@@ -59,6 +80,7 @@
   <!-- Physics libraries -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/poly-decomp@0.3.0/build/decomp.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 
   <!-- Modular application scripts -->
   <script src="config.js"></script>
@@ -66,5 +88,6 @@
   <script src="physics.js"></script>
   <script src="tracking.js"></script>
   <script src="ui.js"></script>
+  <script src="multiplayer.js"></script>
 </body>
 </html>
