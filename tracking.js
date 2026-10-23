@@ -15,6 +15,11 @@ if (typeof GESTURE_ACTIONS !== "undefined") {
 // ------------------------------------------------------------
 // Camera and tracker setup
 // ------------------------------------------------------------
+const TOOLBAR_DRAG_SLOP = 28;
+let h1ToolbarTouch = null;
+let h2ToolbarTouch = null;
+let mouseToolbarTouch = null;
+
 // Turns a camera error into a plain-language message.
 function explainCameraError(err) {
   const name = err && err.name ? err.name : "";
@@ -49,17 +54,21 @@ async function openCameraStream() {
       width: { ideal: 960 },
       height: { ideal: 540 },
       frameRate: { ideal: 60 }
+    },
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true
     }
   };
   try {
     return await navigator.mediaDevices.getUserMedia(wanted);
   } catch (err) {
-    // Camera busy or settings refused: wait a moment and try again with the simplest request.
+    // Preserve video when microphone permission or audio capture is unavailable.
     if (err.name === "NotReadableError" || err.name === "AbortError" || err.name === "OverconstrainedError") {
       await new Promise((resolve) => setTimeout(resolve, 900));
-      return await navigator.mediaDevices.getUserMedia({ video: true });
     }
-    throw err;
+    return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
   }
 }
 
@@ -77,13 +86,32 @@ async function startCamera() {
     err.friendly = explainCameraError(err);
     throw err;
   }
+  window.localAudioAvailable = stream.getAudioTracks().some((track) => track.readyState === "live");
+  video.muted = true;
+  video.playsInline = true;
+  video.setAttribute("muted", "");
+  video.setAttribute("playsinline", "");
   video.srcObject = stream;
-  await new Promise((resolve) => {
-    video.onloadedmetadata = () => resolve();
-  });
-  await video.play();
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  window.dispatchEvent(new Event("local-media-ready"));
+  try {
+    await video.play();
+  } catch (playError) {
+    console.warn("video.play() autoplay notice:", playError);
+  }
+  if (!video.videoWidth || video.readyState < 2) {
+    await new Promise((resolve) => {
+      let timer;
+      const finish = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      video.addEventListener("loadedmetadata", finish, { once: true });
+      video.addEventListener("canplay", finish, { once: true });
+      timer = setTimeout(finish, 1200);
+    });
+  }
+  canvas.width = video.videoWidth || 960;
+  canvas.height = video.videoHeight || 540;
 }
 
 async function startTracker() {
@@ -99,9 +127,9 @@ async function startTracker() {
     },
     runningMode: "VIDEO",
     numHands: 2,
-    minHandDetectionConfidence: 0.6,
-    minHandPresenceConfidence: 0.6,
-    minTrackingConfidence: 0.6
+    minHandDetectionConfidence: 0.35,
+    minHandPresenceConfidence: 0.35,
+    minTrackingConfidence: 0.35
   });
   try {
     landmarker = await HandLandmarker.createFromOptions(fileset, options("GPU"));
@@ -218,9 +246,9 @@ function selectAllObjects() {
   if (typeof syncButtons === "function") syncButtons();
 }
 
-function runAction(name) {
+function runAction(name, triggerPen) {
   if (name === "pause") {
-    pausedWorld = !pausedWorld;
+    setPausedWorld(!pausedWorld);
     showToast(pausedWorld ? "Paused" : "Resumed");
   } else if (name === "selectAll") {
     selectAllObjects();
@@ -259,7 +287,8 @@ function runAction(name) {
     cloneSelected();
   } else if (name === "undo") {
     // Phase 2 swipe-to-erase: if hovering over an object, erase that object; otherwise undo last drawing
-    const hoveredTarget = pen ? objectAtPoint(pen) : null;
+    const activePen = triggerPen || pen || h2.pen;
+    const hoveredTarget = activePen ? objectAtPoint(activePen) : null;
     if (hoveredTarget) {
       redoStack.push(serObj(hoveredTarget));
       shatter(hoveredTarget);
@@ -284,7 +313,7 @@ function runAction(name) {
 // True while the ring is on something that has its own hold action (button, tab).
 function ringOnTarget() {
   if (!pen) return false;
-  if (showBar && buttonAt(pen)) return true;
+  if (showBar && toolbarPanelAt(pen)) return true;
   if (tabAt(pen)) return true;
   return false;
 }
@@ -310,7 +339,7 @@ function updatePose(nowMs) {
     }
   }
 
-  const busy = pinching || grabbed || grabCandidate || tabHold || onCount > 0;
+  const busy = pinching || grabbed || grabCandidate || tabHold || h1ToolbarTouch || onCount > 0;
   if (!real || busy || nowMs < poseBlockUntil) {
     resetPose();
     return;
@@ -342,7 +371,7 @@ function updatePose(nowMs) {
       const need = Math.max(canvas.width * SWIPE_MIN_FRACTION, dist(real[0], real[9]) * SWIPE_MIN_HANDS);
       if (dy < dx * 0.7 && net >= dx * 0.7) swipeProgress = Math.min(1, dx / need);
       if (swipeProgress >= 1 && nowMs >= swipeCooldownUntil) {
-        runAction(SWIPE_ACTION);
+        runAction(SWIPE_ACTION, h2.pen);
         swipeCooldownUntil = nowMs + SWIPE_COOLDOWN_MS;
         poseBlockUntil = nowMs + POSE_POST_PINCH_MS;
         swipeProgress = 0;
@@ -381,6 +410,13 @@ function updatePose(nowMs) {
 }
 
 function endPinch() {
+  if (h1ToolbarTouch) {
+    if (!h1ToolbarTouch.isScrolling) {
+      const button = h1ToolbarTouch.targetBtn || (pen ? buttonAt(pen) : null);
+      if (button) pressButton(button, performance.now());
+    }
+    h1ToolbarTouch = null;
+  }
   if (grabbed) releaseGrab();
   grabCandidate = null;
   tabHold = null;
@@ -476,6 +512,17 @@ function handleHand(landmarks, nowMs) {
           // Pinching on the arrow tab: hold to open or hide the panel (no drawing).
           tabHold = { startMs: nowMs, done: false };
           current = null;
+        } else if (showBar && toolbarPanelAt(pen)) {
+          h1ToolbarTouch = {
+            startY: pen.y,
+            initialScroll: toolbarTargetScrollY,
+            targetBtn: buttonAt(pen),
+            isScrolling: false
+          };
+          current = null;
+        } else if (selected.size > 0 && h2.pinching) {
+          grabCandidate = null;
+          current = null;
         } else {
           const target = objectAtPoint(pen);
           if (target) {
@@ -499,7 +546,17 @@ function handleHand(landmarks, nowMs) {
       }
     } else {
       offCount = 0;
-      if (grabbed) {
+      if (h1ToolbarTouch) {
+        const deltaY = pen.y - h1ToolbarTouch.startY;
+        if (!h1ToolbarTouch.isScrolling && Math.abs(deltaY) > TOOLBAR_DRAG_SLOP) {
+          h1ToolbarTouch.isScrolling = true;
+          h1ToolbarTouch.targetBtn = null;
+        }
+        if (h1ToolbarTouch.isScrolling) {
+          const adjusted = deltaY > 0 ? deltaY - TOOLBAR_DRAG_SLOP : deltaY + TOOLBAR_DRAG_SLOP;
+          setToolbarScroll(h1ToolbarTouch.initialScroll + adjusted * 0.95);
+        }
+      } else if (grabbed) {
         // the held object follows the pen (see stepPhysics)
       } else if (tabHold) {
         const overTab = tabAt(pen);
@@ -566,62 +623,214 @@ function handleHand2(lm, nowMs) {
   const g = REACH_LEVELS[reachIdx];
   const ax = W / 2;
   const ay = H * REACH_ANCHOR_Y;
-  const m = (p) => ({
+  const mapPoint = (p) => ({
     x: ax + ((1 - p.x) * W - ax) * g,
     y: ay + (p.y * H - ay) * g
   });
-  const th = m(lm[4]);
-  const ix = m(lm[8]);
-  const w = m(lm[0]);
-  const mid = m(lm[9]);
+  const pts = lm.map(mapPoint);
+  const th = pts[4];
+  const ix = pts[8];
+  const w = pts[0];
+  const mid = pts[9];
+  const skeleton = lm.map((p) => ({ x: (1 - p.x) * W, y: p.y * H }));
+  const realPen2 = { x: (skeleton[4].x + skeleton[8].x) / 2, y: (skeleton[4].y + skeleton[8].y) / 2 };
   const rawX = Math.min(W, Math.max(0, (th.x + ix.x) / 2));
   const rawY = Math.min(H, Math.max(0, (th.y + ix.y) / 2));
   const t = nowMs / 1000;
   h2.seen = nowMs;
-  {
-    const a = Math.atan2((lm[9].y - lm[0].y) * H, -(lm[9].x - lm[0].x) * W);
-    h2.ang = h2.ang === undefined || h2.ang === null ? a : h2.ang + angDiff(a, h2.ang) * 0.35;
-  }
+  h2.visible = true;
+  h2.skeletonPts = skeleton;
+  h2.realPen = realPen2;
+  const a = Math.atan2(skeleton[9].y - skeleton[0].y, skeleton[9].x - skeleton[0].x);
+  h2.ang = h2.ang === undefined || h2.ang === null ? a : h2.ang + angDiff(a, h2.ang) * 0.35;
   h2.pen = { x: filterX2.filter(rawX, t), y: filterY2.filter(rawY, t) };
   if (!h2.vis) h2.vis = { x: h2.pen.x, y: h2.pen.y };
+  const dt = t - (h2.prevPenT || t);
+  if (h2.prevPenPos && dt > 0) {
+    const vx = (h2.pen.x - h2.prevPenPos.x) / dt;
+    const vy = (h2.pen.y - h2.prevPenPos.y) / dt;
+    h2.penVel.vx = h2.penVel.vx * 0.6 + vx * 0.4;
+    h2.penVel.vy = h2.penVel.vy * 0.6 + vy * 0.4;
+    h2.penSpeed = h2.penSpeed * 0.6 + Math.hypot(vx, vy) * 0.4;
+  }
+  h2.prevPenPos = { x: h2.pen.x, y: h2.pen.y };
+  h2.prevPenT = t;
   const size = Math.hypot(w.x - mid.x, w.y - mid.y);
   const ratio = size > 0 ? Math.hypot(th.x - ix.x, th.y - ix.y) / size : 1;
-  if (!h2.pinch) {
-    h2.on = ratio < PINCH_START ? h2.on + 1 : 0;
-    if (h2.on >= DEBOUNCE_FRAMES) {
-      h2.pinch = true;
-      h2.off = 0;
-    }
-  } else if (ratio > PINCH_STOP) {
-    if (++h2.off >= 3) {
-      h2.pinch = false;
+  h2.lastRatio = ratio;
+  const pose = classifyPose(skeleton);
+  const fistNow = pose === "FIST" || pose === "SHAKA UP" || pose === "SHAKA DOWN" || handClosing(skeleton);
+
+  if (!h2.pinching) {
+    if (ratio < PINCH_START && !fistNow && h2.penSpeed < PINCH_MAX_SPEED) {
+      h2.on++;
+      h2.pending.push({ x: h2.pen.x, y: h2.pen.y });
+      if (h2.on >= DEBOUNCE_FRAMES) {
+        h2.pinching = true;
+        h2.pinch = true;
+        h2.off = 0;
+        if (tabAt(h2.pen)) {
+          toggleBar();
+          h2.current = null;
+        } else if (showBar && toolbarPanelAt(h2.pen)) {
+          h2ToolbarTouch = {
+            startY: h2.pen.y,
+            initialScroll: toolbarTargetScrollY,
+            targetBtn: buttonAt(h2.pen),
+            isScrolling: false
+          };
+          h2.current = null;
+        } else if (showBar && buttonAt(h2.pen)) {
+          pressButton(buttonAt(h2.pen), nowMs);
+          h2.current = null;
+        } else if (selected.size > 0 && pinching) {
+          h2.current = null;
+          h2.grabCandidate = null;
+        } else {
+          const target = objectAtPoint(h2.pen);
+          if (target && !(grabbed && grabbed.obj === target && !target.isMerged)) {
+            h2.grabCandidate = {
+              obj: target,
+              startX: h2.pen.x,
+              startY: h2.pen.y,
+              startMs: nowMs,
+              pts: h2.pending.slice()
+            };
+            h2.current = null;
+          } else {
+            h2.grabCandidate = null;
+            h2.current = h2.pending.slice();
+          }
+        }
+      }
+    } else {
       h2.on = 0;
-      releaseGrab2();
+      h2.pending = [];
     }
   } else {
-    h2.off = 0;
-  }
-  // While pinched and holding nothing, pick up whatever is under the ring (no need to be exact at the first instant).
-  if (h2.pinch && !h2.grab) {
-    const tObj = objectAtPoint(h2.pen);
-    if (tObj && !(grabbed && grabbed.obj === tObj) && !selecting2(tObj)) {
-      const st = !tObj.body || tObj.body.isStatic;
-      const ref = st ? tObj.bodies[0].position : tObj.body.position;
-      const om = st ? 0 : tObj.body.mass;
-      if (!st) Body.setMass(tObj.body, om * GRAB_MASS_MULT);
-      h2.grab = {
-        obj: tObj,
-        st: st,
-        om: om,
-        cvx: 0,
-        cvy: 0,
-        h0: h2.ang,
-        b0: st ? 0 : tObj.body.angle,
-        offX: ref.x - h2.pen.x,
-        offY: ref.y - h2.pen.y
-      };
-      if (typeof playTone === "function") playTone(520, 0.05);
+    if (ratio > PINCH_STOP) {
+      if (++h2.off >= DEBOUNCE_FRAMES) {
+        if (h2ToolbarTouch) {
+          if (!h2ToolbarTouch.isScrolling) {
+            const button = h2ToolbarTouch.targetBtn || buttonAt(h2.pen);
+            if (button) pressButton(button, nowMs);
+          }
+          h2ToolbarTouch = null;
+        }
+        if (h2.grab) releaseGrab2();
+        if (h2.current && !scaleSession) {
+          const prevLast = objects[objects.length - 1];
+          const strokeLength = pathLength(h2.current);
+          commitStroke(h2.current);
+          const last = objects[objects.length - 1];
+          if (last && last !== prevLast) {
+            h2.lastStrokeObj = last;
+            h2.lastStrokeObj.strokeLen = strokeLength;
+            h2.lastStrokeAt = nowMs;
+          }
+        }
+        h2.current = null;
+        h2.grabCandidate = null;
+        h2.pinching = false;
+        h2.pinch = false;
+        h2.on = 0;
+        h2.off = 0;
+        h2.pending = [];
+        h2.poseBlockUntil = nowMs + POSE_POST_PINCH_MS;
+      }
+    } else {
+      h2.off = 0;
+      if (h2ToolbarTouch) {
+        const deltaY = h2.pen.y - h2ToolbarTouch.startY;
+        if (!h2ToolbarTouch.isScrolling && Math.abs(deltaY) > TOOLBAR_DRAG_SLOP) {
+          h2ToolbarTouch.isScrolling = true;
+          h2ToolbarTouch.targetBtn = null;
+        }
+        if (h2ToolbarTouch.isScrolling) {
+          const adjusted = deltaY > 0 ? deltaY - TOOLBAR_DRAG_SLOP : deltaY + TOOLBAR_DRAG_SLOP;
+          setToolbarScroll(h2ToolbarTouch.initialScroll + adjusted * 0.95);
+        }
+      } else if (scaleSession) {
+        h2.current = null;
+      } else if (h2.grab) {
+        // The held body is moved by the physics step.
+      } else if (h2.grabCandidate) {
+        const candidate = h2.grabCandidate;
+        const lastPoint = candidate.pts[candidate.pts.length - 1];
+        if (dist(h2.pen, lastPoint) >= MIN_POINT_GAP) candidate.pts.push({ x: h2.pen.x, y: h2.pen.y });
+        if (dist(h2.pen, { x: candidate.startX, y: candidate.startY }) > GRAB_MOVE_TOL) {
+          h2.current = candidate.pts.slice();
+          h2.grabCandidate = null;
+        } else if (nowMs - candidate.startMs >= GRAB_HOLD_MS) {
+          startGrab2(candidate.obj);
+          h2.grabCandidate = null;
+        }
+      } else if (h2.current) {
+        const lastPoint = h2.current[h2.current.length - 1];
+        if (dist(h2.pen, lastPoint) >= MIN_POINT_GAP) h2.current.push({ x: h2.pen.x, y: h2.pen.y });
+      }
     }
+  }
+  updatePose2(nowMs);
+}
+
+function updatePose2(nowMs) {
+  const real = h2.skeletonPts;
+  if (!real || h2.pinching || h2.grab || h2.grabCandidate || h2ToolbarTouch || nowMs < h2.poseBlockUntil) {
+    h2.candPose = null;
+    h2.candFired = false;
+    h2.wristHist = [];
+    return;
+  }
+  const raw = classifyPose(real);
+  const openish = raw === "OPEN PALM" || (raw === null && extendedCount(real) >= 3);
+  h2.swipeProgress = 0;
+  if (openish && h2.penSpeed > 300) {
+    const center = palmCenter(real);
+    h2.wristHist.push({ x: center.x, y: center.y, t: nowMs });
+    h2.wristHist = h2.wristHist.filter((point) => nowMs - point.t <= SWIPE_WINDOW_MS);
+    if (h2.wristHist.length >= 3) {
+      const xs = h2.wristHist.map((point) => point.x);
+      const ys = h2.wristHist.map((point) => point.y);
+      const dx = Math.max(...xs) - Math.min(...xs);
+      const dy = Math.max(...ys) - Math.min(...ys);
+      const net = Math.abs(h2.wristHist[h2.wristHist.length - 1].x - h2.wristHist[0].x);
+      const need = Math.max(canvas.width * SWIPE_MIN_FRACTION, dist(real[0], real[9]) * SWIPE_MIN_HANDS);
+      if (dy < dx * 0.7 && net >= dx * 0.7) h2.swipeProgress = Math.min(1, dx / need);
+      if (h2.swipeProgress >= 1 && nowMs >= h2.swipeCooldownUntil) {
+        runAction(SWIPE_ACTION);
+        h2.swipeCooldownUntil = nowMs + SWIPE_COOLDOWN_MS;
+        h2.poseBlockUntil = nowMs + POSE_POST_PINCH_MS;
+        h2.candPose = null;
+        h2.candFired = false;
+        return;
+      }
+    }
+  } else {
+    h2.wristHist = [];
+  }
+
+  let pose = tabAt(h2.pen) || (showBar && toolbarPanelAt(h2.pen)) ? null : raw;
+  if (pose === "OPEN PALM" && h2.hoverObj && !pausedWorld) pose = null;
+  if (pose === "OPEN PALM" && selected.size > 0 && nowMs - lastSelectMs < SELECT_SETTLE_MS) pose = null;
+  if (pose) h2.lastPoseMs = nowMs;
+  if (!pose && h2.candPose && nowMs - h2.lastPoseMs < POSE_GRACE_MS) return;
+  const size = dist(real[0], real[9]);
+  if (pose && pose === h2.candPose && h2.candWrist && dist(real[0], h2.candWrist) > size * POSE_MOVE_TOL) {
+    h2.candStartMs = nowMs;
+    h2.candWrist = { x: real[0].x, y: real[0].y };
+    h2.candFired = false;
+  }
+  if (pose !== h2.candPose) {
+    h2.candPose = pose;
+    h2.candStartMs = nowMs;
+    h2.candFired = false;
+    h2.candWrist = pose ? { x: real[0].x, y: real[0].y } : null;
+  }
+  const holdTime = h2.candPose && POSE_HOLD_MS[h2.candPose] ? POSE_HOLD_MS[h2.candPose] : 500;
+  if (h2.candPose && !h2.candFired && nowMs - h2.candStartMs >= holdTime) {
+    h2.candFired = true;
+    runAction(GESTURE_ACTIONS[h2.candPose]);
   }
 }
 
@@ -633,35 +842,79 @@ function handleNoHand2(nowMs) {
   // Forgive short tracking drop-outs so the held object is not dropped on a single missed frame.
   if (nowMs !== undefined && h2.seen && nowMs - h2.seen < 250) return;
   if (h2.grab) releaseGrab2();
+  if (h2.pinching && h2.current && !scaleSession) commitStroke(h2.current);
+  h2.visible = false;
   h2.pen = null;
   h2.vis = null;
+  h2.skeletonPts = null;
+  h2.realPen = null;
+  h2.current = null;
+  h2.grabCandidate = null;
+  h2ToolbarTouch = null;
+  h2.pinching = false;
   h2.pinch = false;
   h2.on = 0;
+  h2.off = 0;
+  h2.pending = [];
+  h2.penSpeed = 0;
+  h2.penVel = { vx: 0, vy: 0 };
+  h2.prevPenPos = null;
+  h2.wristHist = [];
+  h2.candPose = null;
+  h2.candFired = false;
   filterX2.reset();
   filterY2.reset();
+}
+
+function rawPinchMidpoint(landmarks) {
+  return {
+    x: (1 - (landmarks[4].x + landmarks[8].x) / 2) * canvas.width,
+    y: ((landmarks[4].y + landmarks[8].y) / 2) * canvas.height
+  };
 }
 
 // One hand-tracking pass on the newest camera frame.
 function trackFrame() {
   if (!landmarker || video.readyState < 2) return;
   const t0 = performance.now();
-  const result = landmarker.detectForVideo(video, t0);
+  let result;
+  try {
+    result = landmarker.detectForVideo(video, t0);
+  } catch (error) {
+    return;
+  }
   const t1 = performance.now();
   trackMs = trackMs * 0.9 + (t1 - t0) * 0.1;
   if (result.landmarks && result.landmarks.length > 0) {
     const L = result.landmarks;
-    let idx = 0;
-    if (L.length > 1 && realPen) {
-      const d = (i) => Math.hypot(
-        (1 - (L[i][4].x + L[i][8].x) / 2) * canvas.width - realPen.x,
-        ((L[i][4].y + L[i][8].y) / 2) * canvas.height - realPen.y
-      );
-      idx = d(1) < d(0) ? 1 : 0;   // keep the hand that was already drawing as the main hand
-    }
     _hadHand = true;
-    handleHand(L[idx], t1);
-    if (L.length > 1) handleHand2(L[1 - idx], t1);
-    else handleNoHand2(t1);
+    if (L.length === 1) {
+      const point = rawPinchMidpoint(L[0]);
+      const d1 = realPen ? dist(point, realPen) : Infinity;
+      const d2 = h2.realPen ? dist(point, h2.realPen) : Infinity;
+      if ((h2.visible && !handVisible) || (h2.visible && handVisible && d2 < d1)) {
+        handleHand2(L[0], t1);
+        handleNoHand(t1);
+      } else {
+        handleHand(L[0], t1);
+        handleNoHand2(t1);
+      }
+    } else {
+      const points = [rawPinchMidpoint(L[0]), rawPinchMidpoint(L[1])];
+      let firstIsHand1;
+      if (realPen && h2.realPen) {
+        firstIsHand1 = dist(points[0], realPen) + dist(points[1], h2.realPen) <=
+          dist(points[1], realPen) + dist(points[0], h2.realPen);
+      } else if (realPen) {
+        firstIsHand1 = dist(points[0], realPen) <= dist(points[1], realPen);
+      } else if (h2.realPen) {
+        firstIsHand1 = dist(points[1], h2.realPen) <= dist(points[0], h2.realPen);
+      } else {
+        firstIsHand1 = points[0].x <= points[1].x;
+      }
+      handleHand(L[firstIsHand1 ? 0 : 1], t1);
+      handleHand2(L[firstIsHand1 ? 1 : 0], t1);
+    }
   } else {
     if (_hadHand) {
       _hadHand = false;
@@ -695,9 +948,14 @@ canvas.addEventListener("pointerdown", (e) => {
     toggleBar();
     return;
   }
-  const hitButton = showBar ? buttonAt(p0) : null;
-  if (hitButton) {
-    pressButton(hitButton, performance.now());
+  if (showBar && toolbarPanelAt(p0)) {
+    mouseToolbarTouch = {
+      startY: p0.y,
+      initialScroll: toolbarTargetScrollY,
+      targetBtn: buttonAt(p0),
+      isScrolling: false
+    };
+    canvas.setPointerCapture(e.pointerId);
     return;
   }
   if (e.shiftKey) {
@@ -710,19 +968,47 @@ canvas.addEventListener("pointerdown", (e) => {
 });
 
 canvas.addEventListener("pointermove", (e) => {
-  if (!mouseCurrent) return;
   const p = toCanvas(e);
+  if (mouseToolbarTouch) {
+    const deltaY = p.y - mouseToolbarTouch.startY;
+    if (!mouseToolbarTouch.isScrolling && Math.abs(deltaY) > TOOLBAR_DRAG_SLOP) {
+      mouseToolbarTouch.isScrolling = true;
+      mouseToolbarTouch.targetBtn = null;
+    }
+    if (mouseToolbarTouch.isScrolling) {
+      const adjusted = deltaY > 0 ? deltaY - TOOLBAR_DRAG_SLOP : deltaY + TOOLBAR_DRAG_SLOP;
+      setToolbarScroll(mouseToolbarTouch.initialScroll + adjusted * 0.95);
+    }
+    return;
+  }
+  if (!mouseCurrent) return;
   const last = mouseCurrent[mouseCurrent.length - 1];
   if (dist(p, last) >= MIN_POINT_GAP) mouseCurrent.push(p);
 });
 
-function finishMouseStroke() {
+function finishMouseStroke(e) {
+  if (mouseToolbarTouch) {
+    if (!mouseToolbarTouch.isScrolling) {
+      const point = e ? toCanvas(e) : null;
+      const button = mouseToolbarTouch.targetBtn || (point ? buttonAt(point) : null);
+      if (button) pressButton(button, performance.now());
+    }
+    mouseToolbarTouch = null;
+    return;
+  }
   if (mouseCurrent) commitStroke(mouseCurrent);
   mouseCurrent = null;
 }
 
 canvas.addEventListener("pointerup", finishMouseStroke);
 canvas.addEventListener("pointercancel", finishMouseStroke);
+canvas.addEventListener("wheel", (e) => {
+  const point = toCanvas(e);
+  if (toolbarPanelAt(point)) {
+    e.preventDefault();
+    setToolbarScroll(toolbarTargetScrollY - e.deltaY * 0.7);
+  }
+}, { passive: false });
 canvas.addEventListener("dblclick", (e) => {
   const p = toCanvas(e);
   if (tabAt(p) || (showBar && buttonAt(p))) return;
